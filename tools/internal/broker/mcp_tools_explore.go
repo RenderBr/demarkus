@@ -75,6 +75,7 @@ func (g *mcpGateway) handleMarkExplore(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError(fmt.Sprintf("graph scope: %v", err)), nil
 	}
 	g.seedGraphStore(ctx, state)
+	b.WriteString("\n" + g.revalidateBacklinks(ctx, state, docURL))
 	writeBacklinksSection(&b, state.graphStore.BacklinksEnriched(docURL))
 	g.writeSiblingsSection(&b, worldName, path)
 
@@ -95,7 +96,7 @@ func writeBacklinksSection(b *strings.Builder, backlinks []graphstore.BacklinkEn
 	}
 	lines := make([]string, len(backlinks))
 	for i, bl := range backlinks {
-		ann := graph.EdgeAnnotation(bl.Rel, bl.Label, bl.Anchor, bl.Count)
+		ann := graph.EdgeAnnotation(bl.Rel, bl.Label, bl.Anchor, bl.Count) + bl.Observation.Annotation()
 		if bl.Title != "" {
 			lines[i] = fmt.Sprintf("- [%s](%s)%s", bl.Title, bl.URL, ann)
 		} else {
