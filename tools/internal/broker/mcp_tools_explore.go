@@ -8,6 +8,7 @@ import (
 	"github.com/latebit-io/demarkus/client/fetch"
 	"github.com/latebit-io/demarkus/client/graph"
 	"github.com/latebit-io/demarkus/client/graphstore"
+	"github.com/latebit-io/demarkus/client/links"
 	listingpage "github.com/latebit-io/demarkus/client/listing"
 	"github.com/latebit-io/demarkus/client/mcpfmt"
 	"github.com/latebit-io/demarkus/client/mdoutline"
@@ -28,6 +29,7 @@ func (g *mcpGateway) handleMarkExplore(ctx context.Context, req mcp.CallToolRequ
 	}
 	docURL, _, _ := strings.Cut(raw, "#")
 	opts := mcpfmt.Fetch.Options(&req)
+	neighborhoodOpts := mcpfmt.NeighborhoodOptions(&req)
 
 	worldName, path, err := parseToolURL(docURL)
 	if err != nil {
@@ -37,13 +39,30 @@ func (g *mcpGateway) handleMarkExplore(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return g.toolErrorFor("explore", worldName, err), nil
 	}
+	body := result.Response.Body
+	binary := mdoutline.BinaryBody(body)
+	observed := result
+	if binary {
+		observed.Response.Body = ""
+	}
+	state, err := g.graphFor(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("graph scope: %v", err)), nil
+	}
+	g.seedGraphStore(ctx, state)
+	source := docURL
+	if world, ok := g.srv.cfg.FindWorld(worldName); ok {
+		source = links.NodeURL(resolveWorldAddress(&world), path)
+	}
+	state.graphStore.ObserveDocument(docURL, graph.FetchResult{
+		Source: source, Status: observed.Response.Status, Body: observed.Response.Body, Metadata: observed.Response.Metadata,
+	})
 	if result.Response.Status != protocol.StatusOK {
 		return mcp.NewToolResultText(mcpfmt.Format(result, opts)), nil
 	}
-	body := result.Response.Body
 
 	// Binary/non-UTF-8 body: an outline over it is garbage; return a notice.
-	if mdoutline.BinaryBody(body) {
+	if binary {
 		return mcp.NewToolResultText(mcpfmt.FormatWith(result, mdoutline.NonMarkdownNotice(len(body)),
 			map[string]string{"mode": "binary"}, opts)), nil
 	}
@@ -70,13 +89,15 @@ func (g *mcpGateway) handleMarkExplore(ctx context.Context, req mcp.CallToolRequ
 		mdoutline.CappedList(&b, out, exploreSectionCap, "links")
 	}
 
-	state, err := g.graphFor(ctx)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("graph scope: %v", err)), nil
+	b.WriteByte('\n')
+	if neighborhoodOpts.Direction != graphstore.NeighborhoodOutgoing {
+		b.WriteString(g.revalidateBacklinks(ctx, state, docURL))
 	}
-	g.seedGraphStore(ctx, state)
-	b.WriteString("\n" + g.revalidateBacklinks(ctx, state, docURL))
-	writeBacklinksSection(&b, state.graphStore.BacklinksEnriched(docURL))
+	page, queryErr := state.graphStore.Neighborhood(docURL, neighborhoodOpts)
+	if queryErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("query relations: %v", queryErr)), nil
+	}
+	b.WriteString(mcpfmt.FormatNeighborhood(docURL, page))
 	g.writeSiblingsSection(&b, worldName, path)
 
 	fmt.Fprintf(&b, "\nfetch %s#<anchor> for a section; mark_fetch force=true for the full body\n", docURL)
@@ -85,25 +106,6 @@ func (g *mcpGateway) handleMarkExplore(ctx context.Context, req mcp.CallToolRequ
 		"size": fmt.Sprintf("%d bytes, %d lines", len(body), strings.Count(body, "\n")+1),
 	}
 	return mcp.NewToolResultText(mcpfmt.FormatWith(result, b.String(), extra, opts)), nil
-}
-
-// Counts and truncation operate only on the caller's scoped rows.
-func writeBacklinksSection(b *strings.Builder, backlinks []graphstore.BacklinkEntry) {
-	fmt.Fprintf(b, "\n## Backlinks (%d)\n", len(backlinks))
-	if len(backlinks) == 0 {
-		b.WriteString("(none recorded; run mark_graph to populate; the broker's graph store is per-pod and resets on restart)\n")
-		return
-	}
-	lines := make([]string, len(backlinks))
-	for i, bl := range backlinks {
-		ann := graph.EdgeAnnotation(bl.Rel, bl.Label, bl.Anchor, bl.Count) + bl.Observation.Annotation()
-		if bl.Title != "" {
-			lines[i] = fmt.Sprintf("- [%s](%s)%s", bl.Title, bl.URL, ann)
-		} else {
-			lines[i] = "- " + bl.URL + ann
-		}
-	}
-	mdoutline.CappedList(b, lines, exploreSectionCap, "backlinks")
 }
 
 // writeSiblingsSection appends the sibling listing of the document's
