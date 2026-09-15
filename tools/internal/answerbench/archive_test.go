@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/latebit-io/demarkus/protocol/store"
@@ -43,6 +46,35 @@ func exportedDocs(t *testing.T, root string) map[string]store.StoredDocument {
 	return result
 }
 
+type orderedExporter []corpusEntry
+
+func (e orderedExporter) ExportDocs(ctx context.Context, fn func(string, store.StoredDocument) error) error {
+	for _, entry := range e {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(entry.Path, entry.Document); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type generatedExporter int
+
+func (e generatedExporter) ExportDocs(ctx context.Context, fn func(string, store.StoredDocument) error) error {
+	document := store.StoredDocument{Versions: []store.StoredVersion{{Version: 1}}}
+	for i := range int(e) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn("/"+strconv.Itoa(i), document); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestArchiveRoundTripAndDeterminism(t *testing.T) {
 	dir, root := t.TempDir(), archiveSource(t)
 	opts := PackOptions{Root: root, Archive: filepath.Join(dir, "corpus.gz"), Manifest: filepath.Join(dir, "manifest.json"), ID: "test-v1", Source: "mark://fixture"}
@@ -74,12 +106,102 @@ func TestArchiveRoundTripAndDeterminism(t *testing.T) {
 	}
 }
 
+func TestPackRejectsNilOptions(t *testing.T) {
+	const corpusError = "pack requires root, archive, manifest, id and source"
+	if _, err := PackCorpus(t.Context(), nil); err == nil || err.Error() != corpusError {
+		t.Fatalf("PackCorpus error = %v, want %q", err, corpusError)
+	}
+	const exportError = "pack requires source exporter, archive, manifest, id and source"
+	if _, err := PackExport(t.Context(), nil, store.New(t.TempDir())); err == nil || err.Error() != exportError {
+		t.Fatalf("PackExport error = %v, want %q", err, exportError)
+	}
+}
+
+func TestArchiveRestoreIgnoresExporterTraversalOrder(t *testing.T) {
+	dir, root := t.TempDir(), t.TempDir()
+	s := store.New(root)
+	for _, path := range []string{"/docs/topic.md", "/docs/topic/detail.md"} {
+		if _, err := s.WriteVersion(path, 0, []byte("# Topic\n"), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	documents := exportedDocs(t, root)
+	source := orderedExporter{
+		{Path: "/docs/topic.md", Document: documents["/docs/topic.md"]},
+		{Path: "/docs/topic/detail.md", Document: documents["/docs/topic/detail.md"]},
+	}
+	opts := PackOptions{Archive: filepath.Join(dir, "corpus.gz"), Manifest: filepath.Join(dir, "manifest.json"), ID: "ordered-v1", Source: "mark://ordered"}
+	if _, err := PackExport(t.Context(), &opts, source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreCorpus(t.Context(), opts.Manifest, opts.Archive, filepath.Join(dir, "restored")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPackExportRejectsDuplicatePaths(t *testing.T) {
+	dir, root := t.TempDir(), archiveSource(t)
+	document := exportedDocs(t, root)["/index.md"]
+	source := orderedExporter{{Path: "/index.md", Document: document}, {Path: "/index.md", Document: document}}
+	opts := PackOptions{Archive: filepath.Join(dir, "corpus.gz"), Manifest: filepath.Join(dir, "manifest.json"), ID: "duplicate-v1", Source: "mark://duplicate"}
+	if _, err := PackExport(t.Context(), &opts, source); err == nil || !strings.Contains(err.Error(), "duplicate corpus document /index.md") {
+		t.Fatalf("duplicate export error = %v", err)
+	}
+	if _, err := os.Stat(opts.Archive); !os.IsNotExist(err) {
+		t.Fatalf("failed duplicate archive retained: %v", err)
+	}
+	if _, err := os.Stat(opts.Manifest); !os.IsNotExist(err) {
+		t.Fatalf("failed duplicate manifest retained: %v", err)
+	}
+}
+
+func TestExportCorpusRejectsInvalidDocuments(t *testing.T) {
+	valid := store.StoredDocument{Versions: []store.StoredVersion{{Version: 1}}}
+	tests := []struct {
+		name string
+		path string
+		doc  store.StoredDocument
+		want string
+	}{
+		{name: "non-canonical path", path: "docs/x.md", doc: valid, want: "non-canonical corpus document path docs/x.md"},
+		{name: "descending versions", path: "/docs/x.md", doc: store.StoredDocument{Versions: []store.StoredVersion{{Version: 2}, {Version: 1}}}, want: "versions not strictly ascending"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			stats, err := exportCorpus(t.Context(), orderedExporter{{Path: test.path, Document: test.doc}}, &output)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("invalid export error = %v, want %q", err, test.want)
+			}
+			if stats.Documents != 0 || output.Len() != 0 {
+				t.Fatalf("invalid document encoded: stats = %+v, bytes = %d", stats, output.Len())
+			}
+		})
+	}
+}
+
+func TestExportCorpusRejectsExcessiveDocuments(t *testing.T) {
+	stats, err := exportCorpus(t.Context(), generatedExporter(maxCorpusDocuments+1), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "corpus exceeds 100000 documents") {
+		t.Fatalf("excessive export error = %v", err)
+	}
+	if stats.Documents != maxCorpusDocuments {
+		t.Fatalf("exported documents = %d, want %d", stats.Documents, maxCorpusDocuments)
+	}
+}
+
 func TestArchiveRejectsCorruptionAndCleansOwnedOutput(t *testing.T) {
 	dir := t.TempDir()
 	opts := PackOptions{Root: archiveSource(t), Archive: filepath.Join(dir, "corpus.gz"), Manifest: filepath.Join(dir, "manifest.json"), ID: "test-v1", Source: "mark://fixture"}
 	manifest, err := PackCorpus(t.Context(), &opts)
 	if err != nil {
 		t.Fatal(err)
+	}
+	tooMany := manifest
+	tooMany.Documents = maxCorpusDocuments + 1
+	tooMany.Versions = tooMany.Documents
+	if err := validateCorpusManifest(&tooMany); err == nil {
+		t.Fatal("excessive document count accepted")
 	}
 	bad := manifest
 	bad.CorpusSHA256 = digest([]byte("wrong corpus"))
