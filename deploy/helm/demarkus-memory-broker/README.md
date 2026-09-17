@@ -57,7 +57,7 @@ the same Ingress controller through different hostnames:
 | Listener | Default port | Default Ingress host | Purpose |
 | --- | --- | --- | --- |
 | Management API | `:8080` (`server.port`) | `ingress.host` | OIDC login + device flow + token management + `/me/install` (see table below). |
-| MCP gateway | `:8081` (`server.mcp.addr`) | `ingress.mcp.host` (optional) | 12-tool tenant-scoped memory surface over JSON-RPC/Streamable HTTP. See [MCP gateway](#mcp-gateway). |
+| MCP gateway | `:8081` (`server.mcp.addr`) | `ingress.mcp.host` (optional) | tenant-scoped memory tool surface over JSON-RPC/Streamable HTTP. See [MCP gateway](#mcp-gateway). |
 
 The two listeners share auth (`compositeVerifier`), rate-limit
 buckets (per-canonical-email), and the `Issuer` machinery; only the
@@ -301,7 +301,10 @@ fresh-provision 401 is propagation lag, not a real denial. Defaults
 sit well under the typical kubelet sync period; tune up only for
 slow-kubelet clusters.
 
-### Operator reference: 12-tool surface
+`server.mcp.toolProfile` selects the tool surface, `full` (default) or
+`lean`; see "Tool profiles" in `tools/demarkus-knowledge-broker/MCP-API.md`.
+
+### Operator reference: tool surface
 
 See `tools/demarkus-memory-broker/MCP-API.md` in the repo for the
 tool reference. The surface is the direct-MCP parity set scoped to
