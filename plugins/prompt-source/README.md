@@ -18,6 +18,8 @@ Verify without writing:
 cd tools && go run ./plugin-prompts check
 ```
 
+Surface partial: `partials/<name>.tmpl`. Include with `{{template "<name>.tmpl" .}}`.
+
 A `commands/<old>.md.alias` file whose body names another command renders that command's full body under the old name with a `Deprecated alias of /<new>` description prefix, so a renamed command keeps working under both names on every harness while the alias file exists.
 
 ## Store noun
@@ -38,5 +40,5 @@ Every byte here is paid in tokens: session guidance on every session, command an
 - Behavior first. Keep every step, rule, path, flag, shell snippet, output shape, and template directive. Shorten the words around them.
 - Nothing volatile. No timestamps, ids, or counts in guidance, nudges, or descriptions; they break prompt-cache prefixes.
 - No em dashes.
-- Session guidance is the behavioral contract only. A rule the plugin binary enforces at write time (destination, tags, retention, style) is stated once as follow the gate; the read contract rides the MCP server instructions; procedures live in the skill or command that runs them.
+- Rule once. Write gate rules (destination, tags, retention, style): one line, follow the gate. Binary checks (`registry project`, `provision verify-auth`, `detect-promote`): command plus output contract, no prose re-derivation. Read contract: MCP server instructions. Procedures: invoking skill or command. Shared blocks: partial. Reports: pattern plus examples. Session guidance: behavioral contract only.
 - Regenerate and bump the affected plugin lineage in the same PR.
