@@ -6,18 +6,22 @@
 package guidance
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/latebit-io/demarkus/tools/demarkus-plugin/internal/config"
 	"github.com/latebit-io/demarkus/tools/demarkus-plugin/internal/provision"
+	"github.com/latebit-io/demarkus/tools/demarkus-plugin/internal/registry"
 )
 
 // Input selects which surface's session guidance to evaluate.
 type Input struct {
 	Surface      string `json:"surface"`      // memory | knowledge
 	GuidanceFile string `json:"guidanceFile"` // path to the plugin's static guidance md
+	// ProjectDir overrides the harness environment when the adapter passes one.
+	ProjectDir string `json:"projectDir,omitempty"`
 }
 
 // Output carries the guidance text to inject for a session.
@@ -37,15 +41,25 @@ func Evaluate(in Input) (Output, error) {
 	}
 }
 
-func readFile(p string) string {
+// readFile returns the static guidance without the generator's leading HTML
+// comments, which would otherwise ride every session. An empty path is
+// optional; a configured path that cannot be read is an error.
+func readFile(p string) (string, error) {
 	if p == "" {
-		return ""
+		return "", nil
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("read guidance file: %w", err)
 	}
-	return string(b)
+	text := string(b)
+	for {
+		line, rest, found := strings.Cut(text, "\n")
+		if !found || !strings.HasPrefix(line, "<!--") || !strings.HasSuffix(line, "-->") {
+			return strings.TrimLeft(text, "\n"), nil
+		}
+		text = rest
+	}
 }
 
 func memory(in Input) (Output, error) {
@@ -64,10 +78,60 @@ func memory(in Input) (Output, error) {
 	if offer != "" {
 		parts = append(parts, offer)
 	}
-	if g := readFile(in.GuidanceFile); g != "" {
+	header, err := projectHeader(in.ProjectDir)
+	if err != nil {
+		return Output{}, err
+	}
+	if header != "" {
+		parts = append(parts, header)
+	}
+	g, err := readFile(in.GuidanceFile)
+	if err != nil {
+		return Output{}, err
+	}
+	if g != "" {
 		parts = append(parts, g)
 	}
 	return Output{Context: strings.Join(parts, "\n\n")}, nil
+}
+
+// projectHeader states the project slug and bound store as data, so the
+// guidance need not teach the slug rule or the binding lookup. Empty when no
+// project directory is known.
+func projectHeader(dir string) (string, error) {
+	if dir == "" {
+		dir = config.HarnessProjectDir()
+	}
+	if dir == "" {
+		return "", nil
+	}
+	// Bindings are recorded absolute; a relative --project-dir must match them.
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve project dir: %w", err)
+	}
+	bound, err := config.ProjectBinding(dir)
+	if err != nil {
+		return "", err
+	}
+	store := "Bound store: `" + config.LocalMemoryID + "` (local, no project binding)."
+	if bound != "" {
+		joined, err := registry.IsCatalogMemory(bound)
+		if err != nil {
+			return "", err
+		}
+		store = "Bound store: `" + bound + "`."
+		if !joined {
+			store = "Bound store: `" + bound + "` (stale: not in the catalog; run /soul-join or /soul-default)."
+		}
+	}
+	return "Project slug: `" + projectSlug(dir) + "`. " + store, nil
+}
+
+// projectSlug is the memory path segment for a project directory: basename,
+// lowercased, spaces to hyphens.
+func projectSlug(dir string) string {
+	return strings.ReplaceAll(strings.ToLower(filepath.Base(dir)), " ", "-")
 }
 
 // serverHealthWarning delegates to provision.HealthWarning so the health check —
@@ -117,7 +181,11 @@ func knowledge(in Input) (Output, error) {
 		b.WriteString("\n- **" + s + "** (MCP server `" + s + "`)")
 	}
 	parts := []string{b.String()}
-	if g := readFile(in.GuidanceFile); g != "" {
+	g, err := readFile(in.GuidanceFile)
+	if err != nil {
+		return Output{}, err
+	}
+	if g != "" {
 		parts = append(parts, g)
 	}
 	memory, err := config.MemoryConfigured()
