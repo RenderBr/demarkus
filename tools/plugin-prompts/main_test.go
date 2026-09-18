@@ -47,7 +47,7 @@ func TestRepositoryCorpusRendersAllArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifacts, err := renderAll(root)
+	artifacts, err := renderAll(root, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +322,7 @@ func expectedBrandArtifacts(t *testing.T, root string) int {
 		total += countFiles(t, filepath.Join(root, "plugins", "prompt-source", base.Surface), func(name string) bool {
 			return strings.HasSuffix(name, ".tmpl") || strings.HasSuffix(name, ".md.alias")
 		})
-		for _, name := range copiedFiles {
+		for _, name := range brandCopiedRoots(&base) {
 			total += countFiles(t, filepath.Join(root, base.Output, name), func(string) bool { return true })
 		}
 		total += 2 // plugin.json and README
@@ -498,7 +498,7 @@ func TestCursorArtifactsPutHarnessFlagBeforeSubcommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifacts, err := renderAll(root)
+	artifacts, err := renderAll(root, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,10 +29,71 @@ type brand struct {
 
 const brandOutputPrefix = "plugins/brands/"
 
+// brandsFile is the --brands document: brands kept outside the manifest so a
+// downstream repository can render them against an unmodified checkout.
+type brandsFile struct {
+	Brands []brand `json:"brands"`
+}
+
+func loadBrandsFile(path string) ([]brand, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read brands file: %w", err)
+	}
+	spec, err := decodeBrandsFile(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse brands file %s: %w", path, err)
+	}
+	// An empty list is valid: a downstream regen with every brand removed
+	// still needs a successful run to prune its outputs.
+	return spec.Brands, nil
+}
+
+func decodeBrandsFile(raw []byte) (brandsFile, error) {
+	var spec brandsFile
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&spec); err != nil {
+		return brandsFile{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return brandsFile{}, errors.New("unexpected trailing JSON value")
+		}
+		return brandsFile{}, err
+	}
+	// A missing or null list would read as "remove every brand" downstream.
+	if spec.Brands == nil {
+		return brandsFile{}, errors.New(`"brands" must be an array`)
+	}
+	return spec, nil
+}
+
 var pluginNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
-// copiedFiles are the base plugin's non-generated files a brand ships as-is.
-var copiedFiles = []string{".mcp.json", "hooks", "scripts"}
+// harnessLayout names a base plugin's non-generated files: the manifest is
+// rewritten with the brand's name, the rest is copied as-is. Harnesses absent
+// here (pi, OpenCode) carry their names in source and cannot be branded.
+type harnessLayout struct {
+	Manifest string   // plugin manifest with top-level name and description
+	MCP      string   // MCP server config; memory bases only, knowledge registers MCP at join
+	Copied   []string // directories shipped verbatim
+}
+
+var brandLayouts = map[string]harnessLayout{
+	"claude": {Manifest: ".claude-plugin/plugin.json", MCP: ".mcp.json", Copied: []string{"hooks", "scripts"}},
+	"cursor": {Manifest: ".cursor-plugin/plugin.json", MCP: "mcp.json", Copied: []string{"hooks", "scripts"}},
+}
+
+// brandCopiedRoots lists the base files a brand copies; each must exist.
+func brandCopiedRoots(base *target) []string {
+	layout := brandLayouts[base.Harness]
+	roots := append([]string(nil), layout.Copied...)
+	if base.Surface == "memory" {
+		roots = append(roots, layout.MCP)
+	}
+	return roots
+}
 
 func validateBrands(spec *manifest) error {
 	targets := map[string]*target{}
@@ -38,14 +102,16 @@ func validateBrands(spec *manifest) error {
 	}
 	names := map[string]struct{}{}
 	outputs := map[string]struct{}{}
+	// plugin_name is unique per harness; harnesses have separate marketplaces.
+	pluginNames := map[string]struct{}{}
 	for i := range spec.Brands {
 		b := &spec.Brands[i]
 		base, ok := targets[b.Base]
 		if !ok {
 			return fmt.Errorf("brand %q: unknown base target %q", b.Name, b.Base)
 		}
-		if base.Harness != "claude" {
-			return fmt.Errorf("brand %q: only claude targets can be branded (base %q is %s)", b.Name, b.Base, base.Harness)
+		if _, ok := brandLayouts[base.Harness]; !ok {
+			return fmt.Errorf("brand %q: only claude and cursor targets can be branded (base %q is %s)", b.Name, b.Base, base.Harness)
 		}
 		if b.Name == "" || b.Description == "" || !pluginNameRE.MatchString(b.PluginName) {
 			return fmt.Errorf("brand %q: name, description, and a lowercase plugin_name are required", b.Name)
@@ -67,8 +133,13 @@ func validateBrands(spec *manifest) error {
 		if _, dup := outputs[b.Output]; dup {
 			return fmt.Errorf("brand %q: duplicate output %s", b.Name, b.Output)
 		}
+		pluginKey := base.Harness + "/" + b.PluginName
+		if _, dup := pluginNames[pluginKey]; dup {
+			return fmt.Errorf("brand %q: duplicate plugin_name %q on harness %s", b.Name, b.PluginName, base.Harness)
+		}
 		names[b.Name] = struct{}{}
 		outputs[b.Output] = struct{}{}
+		pluginNames[pluginKey] = struct{}{}
 	}
 	return nil
 }
@@ -109,7 +180,7 @@ func brandArtifacts(root string, b *brand, base, t *target) ([]artifact, error) 
 	var out []artifact
 	baseDir := filepath.Join(root, base.Output)
 	outDir := filepath.Join(root, b.Output)
-	for _, name := range copiedFiles {
+	for _, name := range brandCopiedRoots(base) {
 		err := filepath.WalkDir(filepath.Join(baseDir, name), func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -136,12 +207,13 @@ func brandArtifacts(root string, b *brand, base, t *target) ([]artifact, error) 
 			return nil, fmt.Errorf("brand %s: copy %s: %w", b.Name, name, err)
 		}
 	}
-	pluginJSON, err := brandPluginJSON(filepath.Join(baseDir, ".claude-plugin", "plugin.json"), base.PluginName, b)
+	manifest := filepath.FromSlash(brandLayouts[base.Harness].Manifest)
+	pluginJSON, err := brandPluginJSON(filepath.Join(baseDir, manifest), base.PluginName, b)
 	if err != nil {
 		return nil, fmt.Errorf("brand %s: %w", b.Name, err)
 	}
 	out = append(out,
-		artifact{Path: filepath.Join(outDir, ".claude-plugin", "plugin.json"), Content: pluginJSON, Target: t, Copied: true},
+		artifact{Path: filepath.Join(outDir, manifest), Content: pluginJSON, Target: t, Copied: true},
 		artifact{Path: filepath.Join(outDir, "README.md"), Content: []byte(brandReadme(b, base)), Target: t, Copied: true},
 	)
 	return out, nil
@@ -183,8 +255,9 @@ This plugin is generated from the %s plugin in the demarkus repository
 name; it shares the demarkus-plugin binary, the "demarkus-memory" MCP server key,
 and the ~/.demarkus state, so install it instead of, not alongside, %s.
 
-Regenerate after editing the templates or the base plugin:
+Regenerate from a demarkus checkout after editing the templates, the base
+plugin, or the brand entry:
 
-    cd tools && go run ./plugin-prompts write
+    cd tools && go run ./plugin-prompts write [--brands <file>]
 `, b.PluginName, b.Description, base.PluginName, base.Output, base.PluginName)
 }

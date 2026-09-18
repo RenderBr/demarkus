@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -81,11 +82,22 @@ type artifact struct {
 
 func main() {
 	mode := "check"
-	if len(os.Args) > 1 {
-		mode = os.Args[1]
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		mode, args = args[0], args[1:]
 	}
-	if mode != "check" && mode != "write" {
-		fmt.Fprintln(os.Stderr, "usage: plugin-prompts [check|write]")
+	flags := flag.NewFlagSet("plugin-prompts", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	brandsPath := flags.String("brands", "", "extra brands file ({\"brands\": [...]}) rendered alongside the manifest")
+	flags.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: plugin-prompts [check|write] [--brands <file>]")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(args); err != nil {
+		os.Exit(2) // the flag set already printed the error and usage
+	}
+	if flags.NArg() > 0 || (mode != "check" && mode != "write") {
+		flags.Usage()
 		os.Exit(2)
 	}
 
@@ -98,7 +110,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	artifacts, err := renderAll(root)
+	artifacts, err := renderAll(root, *brandsPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -135,7 +147,9 @@ func findRoot() (string, error) {
 	}
 }
 
-func renderAll(root string) ([]artifact, error) {
+// renderAll renders the manifest's targets and brands; brandsPath, when set,
+// names a brands file whose entries are added to the manifest's brands.
+func renderAll(root, brandsPath string) ([]artifact, error) {
 	manifestPath := filepath.Join(root, "plugins", "prompt-source", "manifest.json")
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -147,6 +161,13 @@ func renderAll(root string) ([]artifact, error) {
 	}
 	if err := validateManifest(&spec); err != nil {
 		return nil, err
+	}
+	if brandsPath != "" {
+		extra, err := loadBrandsFile(brandsPath)
+		if err != nil {
+			return nil, err
+		}
+		spec.Brands = append(spec.Brands, extra...)
 	}
 	if err := validateBrands(&spec); err != nil {
 		return nil, err
@@ -555,21 +576,48 @@ func writeAll(root string, artifacts []artifact) error {
 			return fmt.Errorf("chmod %s: %w", artifact.Path, err)
 		}
 	}
-	return pruneBrandOutputs(root, artifacts, expected)
+	return pruneBrandOutputs(root, expected)
 }
 
-// pruneBrandOutputs deletes files under brand outputs that no artifact
-// produced, so write converges on the check that reports them as stale.
+// brandDirs lists every directory under plugins/brands/. Each is generated
+// in full by the current brand set, so one whose brand was removed is stale
+// too; top-level files there (README.md) are hand-kept.
+func brandDirs(root string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(brandOutputPrefix)))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", brandOutputPrefix, err)
+	}
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(root, filepath.FromSlash(brandOutputPrefix), entry.Name()))
+		}
+	}
+	return dirs, nil
+}
+
+// pruneBrandOutputs deletes files under plugins/brands/*/ that no artifact
+// produced, then the directories left empty, so write converges on the check.
 // Canonical plugins are never pruned: they mix generated and hand-kept files.
-func pruneBrandOutputs(root string, artifacts []artifact, expected map[string]struct{}) error {
-	for _, output := range brandOutputs(artifacts) {
-		dir := filepath.Join(root, output)
-		var stale []string
+func pruneBrandOutputs(root string, expected map[string]struct{}) error {
+	dirs, err := brandDirs(root)
+	if err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		var stale, subdirs []string
 		err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
-			if _, ok := expected[filepath.Clean(path)]; !entry.IsDir() && !ok {
+			if entry.IsDir() {
+				subdirs = append(subdirs, path)
+				return nil
+			}
+			if _, ok := expected[filepath.Clean(path)]; !ok {
 				stale = append(stale, path)
 			}
 			return nil
@@ -581,26 +629,29 @@ func pruneBrandOutputs(root string, artifacts []artifact, expected map[string]st
 			if err := os.Remove(path); err != nil {
 				return fmt.Errorf("remove stale %s: %w", path, err)
 			}
-			fmt.Printf("removed stale brand file %s\n", filepath.ToSlash(strings.TrimPrefix(path, root+string(filepath.Separator))))
+			fmt.Printf("removed stale brand file %s\n", relSlash(root, path))
+		}
+		// Deepest first, so a directory is visited after its children.
+		sort.Sort(sort.Reverse(sort.StringSlice(subdirs)))
+		for _, path := range subdirs {
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return fmt.Errorf("list %s: %w", path, err)
+			}
+			if len(entries) > 0 {
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove empty %s: %w", path, err)
+			}
+			fmt.Printf("removed empty brand directory %s\n", relSlash(root, path))
 		}
 	}
 	return nil
 }
 
-// brandOutputs lists the distinct brand output dirs among the artifacts.
-func brandOutputs(artifacts []artifact) []string {
-	seen := map[string]struct{}{}
-	var outputs []string
-	for i := range artifacts {
-		output := artifacts[i].Target.Output
-		if _, ok := seen[output]; ok || !strings.HasPrefix(filepath.ToSlash(output), brandOutputPrefix) {
-			continue
-		}
-		seen[output] = struct{}{}
-		outputs = append(outputs, output)
-	}
-	sort.Strings(outputs)
-	return outputs
+func relSlash(root, path string) string {
+	return filepath.ToSlash(strings.TrimPrefix(path, root+string(filepath.Separator)))
 }
 
 func checkAll(root string, artifacts []artifact) error {
@@ -621,36 +672,42 @@ func checkAll(root string, artifacts []artifact) error {
 			drift = append(drift, filepath.ToSlash(strings.TrimPrefix(artifact.Path, root+string(filepath.Separator))))
 		}
 	}
+	// Canonical plugins mix generated prompts with hand-kept files: only their
+	// prompt subtrees are scanned. Every plugins/brands/*/ directory is scanned
+	// in full, whether or not a configured brand still produces it.
+	var scans []string
 	outputs := make(map[string]struct{})
 	for i := range artifacts {
-		outputs[artifacts[i].Target.Output] = struct{}{}
-	}
-	for output := range outputs {
-		// A brand directory is generated in full, so every file in it is
-		// managed; canonical plugins mix generated prompts with hand-kept files.
-		subtrees := []string{"commands", "context", "skills"}
-		managedOnly := false
-		if strings.HasPrefix(filepath.ToSlash(output), brandOutputPrefix) {
-			subtrees = []string{""}
-			managedOnly = true
+		output := artifacts[i].Target.Output
+		if _, seen := outputs[output]; seen || strings.HasPrefix(filepath.ToSlash(output), brandOutputPrefix) {
+			continue
 		}
-		for _, subtree := range subtrees {
-			dir := filepath.Join(root, output, subtree)
-			err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-				if entry.IsDir() || (!managedOnly && filepath.Ext(path) != ".md") {
-					return nil
-				}
-				if _, ok := expected[filepath.Clean(path)]; !ok {
-					drift = append(drift, filepath.ToSlash(strings.TrimPrefix(path, root+string(filepath.Separator)))+" (unexpected)")
-				}
-				return nil
-			})
-			if err != nil {
-				return fmt.Errorf("scan generated output %s: %w", dir, err)
+		outputs[output] = struct{}{}
+		for _, subtree := range []string{"commands", "context", "skills"} {
+			scans = append(scans, filepath.Join(root, output, subtree))
+		}
+	}
+	dirs, err := brandDirs(root)
+	if err != nil {
+		return err
+	}
+	scans = append(scans, dirs...)
+	for _, dir := range scans {
+		managedOnly := strings.HasPrefix(relSlash(root, dir), brandOutputPrefix)
+		err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
+			if entry.IsDir() || (!managedOnly && filepath.Ext(path) != ".md") {
+				return nil
+			}
+			if _, ok := expected[filepath.Clean(path)]; !ok {
+				drift = append(drift, relSlash(root, path)+" (unexpected)")
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("scan generated output %s: %w", dir, err)
 		}
 	}
 	if len(drift) > 0 {
