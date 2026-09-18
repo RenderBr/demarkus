@@ -28,6 +28,42 @@ func setupConfigHome(t *testing.T, files map[string]string) string {
 	return dir
 }
 
+func TestLocalMemoryAliasResolvesBrandedServer(t *testing.T) {
+	branded := "mcp__plugin_acme-brain_memory__mark_publish"
+	setupConfigHome(t, map[string]string{"knowledge-systems": "corp\n"})
+	if id, err := MemoryTargetID(branded); err != nil || id != "" {
+		t.Fatalf("no alias: id=%q err=%v", id, err)
+	}
+	setupConfigHome(t, map[string]string{"knowledge-systems": "corp\n", LocalMemoryAliasFile: "0123abcd memory\n"})
+	if alias, token, err := LocalMemoryAliasRecord(); err != nil || alias != "memory" || token != "0123abcd" {
+		t.Fatalf("record = %q %q %v", alias, token, err)
+	}
+	for _, tool := range []string{branded, "mcp__memory__mark_append", "memory_mark_publish", "mcp__plugin_demarkus-memory_demarkus-memory__mark_publish"} {
+		id, err := MemoryTargetID(tool)
+		if err != nil || id != LocalMemoryID {
+			t.Fatalf("%s: id=%q err=%v", tool, id, err)
+		}
+		scope, err := KnowledgeScope(tool)
+		if err != nil || scope != "" {
+			t.Fatalf("%s: knowledge scope=%q err=%v", tool, scope, err)
+		}
+	}
+	if scope, err := KnowledgeScope("mcp__corp__mark_publish"); err != nil || scope != "corp" {
+		t.Fatalf("knowledge tool: scope=%q err=%v", scope, err)
+	}
+	// Catalog reservation shares the routing predicate: acme-memory would be
+	// read as plugin "acme" serving "memory".
+	for slug, want := range map[string]bool{"memory": true, "demarkus_memory": true, "acme-memory": true, "corp": false} {
+		if got, err := ResolvesToLocalMemory(slug); err != nil || got != want {
+			t.Fatalf("ResolvesToLocalMemory(%q) = %v, %v", slug, got, err)
+		}
+	}
+	setupConfigHome(t, map[string]string{LocalMemoryAliasFile: "memory\n"})
+	if alias, token, err := LocalMemoryAliasRecord(); err != nil || alias != "memory" || token != "" {
+		t.Fatalf("token-less record = %q %q %v", alias, token, err)
+	}
+}
+
 func TestKnowledgePolicy(t *testing.T) {
 	t.Run("defaults to warn", func(t *testing.T) {
 		setupConfigHome(t, nil)

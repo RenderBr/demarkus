@@ -535,8 +535,13 @@ func cmdMcpServe(args []string) {
 	fs := flag.NewFlagSet("mcp-serve", flag.ExitOnError)
 	memory := fs.String("memory", "", "joined remote-memory slug (omit for the local managed memory)")
 	fs.StringVar(memory, "soul", "", "deprecated alias of -memory")
+	name := fs.String("name", "", "MCP server name a branded plugin registers the local memory under; recorded so gates resolve it")
 	_ = fs.Parse(args) // ExitOnError: Parse never returns
 
+	if *name != "" && *memory != "" {
+		fmt.Fprintln(os.Stderr, "[demarkus-plugin] mcp-serve: -name applies to the local managed memory only")
+		os.Exit(2)
+	}
 	binDir, err := config.StatePath("bin")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "[demarkus-plugin] mcp-serve: "+err.Error())
@@ -576,8 +581,25 @@ func cmdMcpServe(args []string) {
 		argv = append(argv, "-insecure")
 	}
 	argv = append(argv, fs.Args()...) // forward any extra args the harness appends
+
+	// Record the alias last, once startup can no longer fail short of exec: a
+	// rejected name (one a joined store uses) must not start the server, and a
+	// persisted name without a running server would strand the gates.
+	previous, token := "", ""
+	if *memory == "" {
+		if previous, token, err = registry.SetLocalMemoryAlias(*name); err != nil {
+			fmt.Fprintln(os.Stderr, "[demarkus-plugin] mcp-serve: record local memory alias: "+err.Error())
+			os.Exit(1)
+		}
+	}
 	if err := syscall.Exec(mcpBin, argv, env); err != nil {
 		fmt.Fprintln(os.Stderr, "[demarkus-plugin] mcp-serve: exec failed: "+err.Error())
+		if *memory == "" {
+			// Only while our write is still the stored one: a later mcp-serve may have started.
+			if rerr := registry.RestoreLocalMemoryAlias(previous, token); rerr != nil {
+				fmt.Fprintln(os.Stderr, "[demarkus-plugin] mcp-serve: restore local memory alias: "+rerr.Error())
+			}
+		}
 		os.Exit(1)
 	}
 }
