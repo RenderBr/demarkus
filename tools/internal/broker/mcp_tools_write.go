@@ -7,7 +7,8 @@ import (
 	"strings"
 
 	"github.com/latebit-io/demarkus/client/fetch"
-	"github.com/latebit-io/demarkus/client/index"
+	"github.com/latebit-io/demarkus/client/generation"
+	"github.com/latebit-io/demarkus/client/marktools"
 	"github.com/latebit-io/demarkus/client/mcpfmt"
 	"github.com/latebit-io/demarkus/client/merge"
 	"github.com/latebit-io/demarkus/client/metaguard"
@@ -74,12 +75,8 @@ func (g *mcpGateway) gateWrite(claims *Claims, worldName string) (*WorldConfig, 
 // caller-supplied "agent" key so identity cannot be spoofed. The world
 // validates keys/values and rejects reserved keys, so this stays a thin
 // pass-through.
-func publisherMeta(args map[string]any, claims *Claims) map[string]string {
+func publisherMeta(raw map[string]any, claims *Claims) map[string]string {
 	meta := agentMetaFromClaims(claims)
-	raw, ok := args["metadata"].(map[string]any)
-	if !ok {
-		return meta
-	}
 	for k, v := range raw {
 		if k == "agent" {
 			continue // identity is broker-set; callers cannot override it
@@ -118,6 +115,10 @@ func (g *mcpGateway) handleMarkPublish(ctx context.Context, req mcp.CallToolRequ
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	callerMeta, err := marktools.MetadataArg(req.GetArguments())
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 	claims, ok := claimsFromCtx(ctx)
 	if !ok {
 		return mcp.NewToolResultError("internal: missing identity on tool-call context"), nil
@@ -125,14 +126,14 @@ func (g *mcpGateway) handleMarkPublish(ctx context.Context, req mcp.CallToolRequ
 	if _, errRes := g.gateWrite(claims, worldName); errRes != nil {
 		return errRes, nil
 	}
-	meta := publisherMeta(req.GetArguments(), claims)
+	meta := publisherMeta(callerMeta, claims)
 	// Warn-only narrowing gate, run after a write that landed.
 	gate := func(status string) string {
 		if !protocol.IsWriteSuccess(status) {
 			return ""
 		}
 		note, gateErr := metaguard.Gate(ctx, expectedVersion, meta, func(ctx context.Context) (fetch.Result, error) {
-			return g.dispatcher.FetchContext(ctx, worldName, index.VersionPath(path, expectedVersion), "")
+			return g.dispatcher.Fetch(ctx, fetch.FetchRequest{Host: worldName, Path: generation.VersionPath(path, expectedVersion)})
 		})
 		if gateErr != nil {
 			g.log.Warn("publish metadata check failed", "world", worldName, "path", path, "err", gateErr)
@@ -140,12 +141,8 @@ func (g *mcpGateway) handleMarkPublish(ctx context.Context, req mcp.CallToolRequ
 		return note
 	}
 	if onConflict == merge.OnConflictMerge {
-		adapter := &brokerMergeAdapter{
-			g:         g,
-			ctx:       ctx,
-			worldName: worldName,
-		}
-		outcome, mErr := merge.Candidate(adapter, path, body, expectedVersion, meta)
+		adapter := &brokerMergeAdapter{g: g, worldName: worldName}
+		outcome, mErr := merge.Candidate(ctx, adapter, merge.Write{Path: path, Body: body, ExpectedVersion: expectedVersion, Metadata: meta})
 		if mErr != nil {
 			return g.toolErrorFor("publish", worldName, mErr), nil
 		}
@@ -153,7 +150,10 @@ func (g *mcpGateway) handleMarkPublish(ctx context.Context, req mcp.CallToolRequ
 	}
 	// on_conflict=fail: the world's conflict status is forwarded verbatim.
 	result, perr := g.dispatchWithWriteAuth(ctx, worldName, func(token string) (fetch.Result, error) {
-		return g.dispatcher.Publish(worldName, path, body, token, expectedVersion, meta)
+		return g.dispatcher.Publish(ctx, fetch.WriteRequest{
+			Host: worldName, Path: path, Body: body, Token: token,
+			ExpectedVersion: expectedVersion, Metadata: meta,
+		})
 	})
 	if perr != nil {
 		return g.toolErrorFor("publish", worldName, perr), nil
@@ -162,21 +162,17 @@ func (g *mcpGateway) handleMarkPublish(ctx context.Context, req mcp.CallToolRequ
 }
 
 // brokerMergeAdapter keeps merge reads public and applies a publish token
-// only to the final write. Each request owns one adapter and context.
+// only to the final write.
 type brokerMergeAdapter struct {
 	g         *mcpGateway
-	ctx       context.Context
 	worldName string
 }
 
-// FetchVersion fetches a specific historical version via the
-// /path/vN suffix the server understands. Same convention the
-// local demarkus-mcp uses; mirroring it keeps the merge base/
-// theirs/ours triple consistent across direct-QUIC and
-// brokered access.
-func (a *brokerMergeAdapter) FetchVersion(path string, version int) (merge.Doc, error) {
+// FetchVersion fetches one historical version through the /path/vN suffix,
+// as the local demarkus-mcp does.
+func (a *brokerMergeAdapter) FetchVersion(ctx context.Context, path string, version int) (merge.Doc, error) {
 	versionedPath := strings.TrimRight(path, "/") + "/v" + strconv.Itoa(version)
-	r, err := a.g.dispatcher.Fetch(a.worldName, versionedPath, "")
+	r, err := a.g.dispatcher.Fetch(ctx, fetch.FetchRequest{Host: a.worldName, Path: versionedPath})
 	if err != nil {
 		return merge.Doc{}, err
 	}
@@ -184,8 +180,8 @@ func (a *brokerMergeAdapter) FetchVersion(path string, version int) (merge.Doc, 
 }
 
 // FetchCurrent fetches the public head version of path.
-func (a *brokerMergeAdapter) FetchCurrent(path string) (merge.Doc, error) {
-	r, err := a.g.dispatcher.Fetch(a.worldName, path, "")
+func (a *brokerMergeAdapter) FetchCurrent(ctx context.Context, path string) (merge.Doc, error) {
+	r, err := a.g.dispatcher.Fetch(ctx, fetch.FetchRequest{Host: a.worldName, Path: path})
 	if err != nil {
 		return merge.Doc{}, err
 	}
@@ -194,9 +190,12 @@ func (a *brokerMergeAdapter) FetchCurrent(path string) (merge.Doc, error) {
 
 // Publish forwards to the dispatcher and lifts the protocol response into
 // a merge.PublishResult; the full metadata map rides along for the formatter.
-func (a *brokerMergeAdapter) Publish(path, body string, expectedVersion int, meta map[string]string) (merge.PublishResult, error) {
-	r, err := a.g.dispatchWithWriteAuth(a.ctx, a.worldName, func(token string) (fetch.Result, error) {
-		return a.g.dispatcher.Publish(a.worldName, path, body, token, expectedVersion, meta)
+func (a *brokerMergeAdapter) Publish(ctx context.Context, w merge.Write) (merge.PublishResult, error) {
+	r, err := a.g.dispatchWithWriteAuth(ctx, a.worldName, func(token string) (fetch.Result, error) {
+		return a.g.dispatcher.Publish(ctx, fetch.WriteRequest{
+			Host: a.worldName, Path: w.Path, Body: w.Body, Token: token,
+			ExpectedVersion: w.ExpectedVersion, Metadata: w.Metadata,
+		})
 	})
 	if err != nil {
 		return merge.PublishResult{}, err
@@ -214,12 +213,11 @@ func (a *brokerMergeAdapter) Publish(path, body string, expectedVersion int, met
 		Version:       v,
 		ServerVersion: sv,
 		Metadata:      r.Response.Metadata,
+		Body:          r.Response.Body,
 	}, nil
 }
 
-// mergeDocFromResult lifts a fetch.Result into the merge
-// package's Doc type, extracting the integer version from
-// response metadata.
+// mergeDocFromResult lifts a fetch.Result into a merge.Doc.
 func mergeDocFromResult(r fetch.Result) (merge.Doc, error) {
 	v, err := optionalIntMeta(r.Response.Metadata, "version")
 	if err != nil {
@@ -262,6 +260,7 @@ func formatMergeOutcome(o *merge.Outcome) string {
 			Response: protocol.Response{
 				Status:   o.Publish.Status,
 				Metadata: o.Publish.Metadata,
+				Body:     o.Publish.Body,
 			},
 		}, "version", "modified", "server-version")
 	case merge.OutcomeCandidate:
@@ -310,7 +309,7 @@ func (g *mcpGateway) handleMarkAppend(ctx context.Context, req mcp.CallToolReque
 	}
 	if expectedVersion == 0 {
 		// Version discovery is a public read and must not mint a publish token.
-		vResult, vErr := g.dispatcher.Versions(worldName, path, "")
+		vResult, vErr := g.dispatcher.Versions(ctx, fetch.VersionsRequest{Host: worldName, Path: path})
 		if vErr != nil {
 			return g.toolErrorFor("append (auto-resolve)", worldName, vErr), nil
 		}
@@ -329,7 +328,10 @@ func (g *mcpGateway) handleMarkAppend(ctx context.Context, req mcp.CallToolReque
 	}
 	meta := agentMetaFromClaims(claims)
 	result, err := g.dispatchWithWriteAuth(ctx, worldName, func(token string) (fetch.Result, error) {
-		return g.dispatcher.Append(worldName, path, body, token, expectedVersion, meta)
+		return g.dispatcher.Append(ctx, fetch.WriteRequest{
+			Host: worldName, Path: path, Body: body, Token: token,
+			ExpectedVersion: expectedVersion, Metadata: meta,
+		})
 	})
 	if err != nil {
 		return g.toolErrorFor("append", worldName, err), nil
@@ -359,7 +361,7 @@ func (g *mcpGateway) handleMarkArchive(ctx context.Context, req mcp.CallToolRequ
 		return errRes, nil
 	}
 	result, err := g.dispatchWithWriteAuth(ctx, worldName, func(token string) (fetch.Result, error) {
-		return g.dispatcher.Archive(worldName, path, token)
+		return g.dispatcher.Archive(ctx, fetch.ArchiveRequest{Host: worldName, Path: path, Token: token})
 	})
 	if err != nil {
 		return g.toolErrorFor("archive", worldName, err), nil
