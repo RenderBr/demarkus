@@ -25,8 +25,6 @@ const maxRateWaitBudget = 10 * time.Second
 type Config struct {
 	Name              string
 	Store             backend.Store
-	Catalog           backend.Catalog
-	Views             backend.ViewProvider
 	CloseBackend      func() error
 	TokensFile        string
 	DisableTokenWatch bool
@@ -75,7 +73,7 @@ func New(config *Config) (*Runtime, error) {
 	}
 	logger := config.Logger
 	if logger == nil {
-		logger = slog.Default()
+		return nil, errors.New("world runtime: logger is nil")
 	}
 	if config.Name != "" {
 		logger = logger.With("world", config.Name)
@@ -93,8 +91,6 @@ func New(config *Config) (*Runtime, error) {
 	}
 	runtime.handler = &handler.Handler{
 		Store:         config.Store,
-		Catalog:       config.Catalog,
-		Views:         config.Views,
 		GetTokenStore: tokens.Current,
 		Logger:        logger,
 		ReadOnly:      config.ReadOnly,
@@ -160,7 +156,7 @@ func (r *Runtime) serveStream(ctx context.Context, remote net.Addr, stream quics
 		cancel()
 		if err != nil {
 			logger.Warn("rate limited", "ip", ratelimit.ExtractIP(remote), "error", err)
-			if writeErr := writeRateLimited(stream); writeErr != nil {
+			if writeErr := r.writeRateLimited(stream); writeErr != nil {
 				logger.Warn("writing rate-limited response", "ip", ratelimit.ExtractIP(remote), "error", writeErr)
 			}
 			if closeErr := stream.Close(); closeErr != nil {
@@ -169,14 +165,24 @@ func (r *Runtime) serveStream(ctx context.Context, remote net.Addr, stream quics
 			return
 		}
 	}
+	requestCtx := ctx
 	if r.requestTimeout > 0 {
-		if err := stream.SetReadDeadline(time.Now().Add(r.requestTimeout)); err != nil {
+		// The write bound keeps a client that stops reading from pinning the
+		// read view and a concurrency slot; store calls share the deadline.
+		deadline := time.Now().Add(r.requestTimeout)
+		var cancel context.CancelFunc
+		requestCtx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+		if err := stream.SetReadDeadline(deadline); err != nil {
 			logger.Debug("setting stream read deadline", "error", err)
+		}
+		if err := stream.SetWriteDeadline(deadline); err != nil {
+			logger.Debug("setting stream write deadline", "error", err)
 		}
 	}
 	requestHandler := *r.handler
 	requestHandler.Logger = logger
-	requestHandler.HandleStream(stream)
+	requestHandler.HandleStream(requestCtx, stream)
 }
 
 func (r *Runtime) acquire(ctx context.Context, remote net.Addr, stream quicserve.Stream, logger *slog.Logger) bool {
@@ -192,7 +198,7 @@ func (r *Runtime) acquire(ctx context.Context, remote net.Addr, stream quicserve
 	case <-waitCtx.Done():
 		ip := ratelimit.ExtractIP(remote)
 		logger.Warn("concurrency limited", "ip", ip, "error", waitCtx.Err())
-		if err := writeRateLimited(stream); err != nil {
+		if err := r.writeRateLimited(stream); err != nil {
 			logger.Warn("writing concurrency-limited response", "ip", ip, "error", err)
 		}
 		if err := stream.Close(); err != nil {
@@ -262,7 +268,16 @@ func (r *Runtime) Close() error {
 	return r.closeErr
 }
 
-func writeRateLimited(stream quicserve.Stream) error {
+// writeRateLimited refuses before the request deadlines exist, so it bounds
+// its own write: a peer that stops reading must not hold the stream open.
+func (r *Runtime) writeRateLimited(stream quicserve.Stream) error {
+	budget := r.requestTimeout
+	if budget <= 0 {
+		budget = maxRateWaitBudget
+	}
+	if err := stream.SetWriteDeadline(time.Now().Add(budget)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
 	_, err := protocol.Response{Status: protocol.StatusRateLimited}.WriteTo(stream)
 	return err
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/latebit-io/demarkus/protocol"
+	"github.com/latebit-io/demarkus/protocol/render"
 )
 
 // fakeDoc is one stored document; Status defaults to ok.
@@ -68,19 +69,20 @@ func (f *fakeStore) List(_ context.Context, dir string, _ bool, cursor string) (
 		}
 	}
 	end := min(start+f.pageSize, len(sorted))
-	var b strings.Builder
-	b.WriteString("\n# Index of " + dir + "\n\n")
+	// The page is the server's own rendering, so the walker is tested
+	// against the real shape, escaping included.
+	entries := make([]render.ListEntry, 0, end-start)
 	for _, n := range sorted[start:end] {
-		b.WriteString("- [" + n + "](" + n + ")\n")
+		entries = append(entries, render.ListEntry{Name: strings.TrimSuffix(n, "/"), IsDir: strings.HasSuffix(n, "/")})
 	}
-	meta := map[string]string{"entries": strconv.Itoa(end - start), "complete": strconv.FormatBool(end == len(sorted))}
+	nextCursor := ""
 	if end < len(sorted) {
-		meta["next-cursor"] = strings.TrimSuffix(sorted[end-1], "/")
+		nextCursor = strings.TrimSuffix(sorted[end-1], "/")
 		if f.stuck {
-			meta["next-cursor"] = "x"
+			nextCursor = "x"
 		}
 	}
-	return protocol.Response{Status: protocol.StatusOK, Metadata: meta, Body: b.String()}, nil
+	return render.ListResponse(dir, entries, nextCursor), nil
 }
 
 func (f *fakeStore) Fetch(_ context.Context, docPath string) (protocol.Response, error) {
@@ -124,11 +126,11 @@ func (f *fakeStore) Versions(_ context.Context, docPath string) (protocol.Respon
 	if !ok {
 		return protocol.Response{Status: protocol.StatusNotFound}, nil
 	}
-	meta := map[string]string{"total": strconv.Itoa(len(d.Versions) + 1), "current": strconv.Itoa(len(d.Versions) + 1), "chain-valid": "true"}
-	if d.Meta["chain-valid"] == "false" {
-		meta["chain-valid"], meta["chain-error"] = "false", "chain integrity check failed"
+	history := make([]render.VersionEntry, 0, len(d.Versions)+1)
+	for v := len(d.Versions) + 1; v >= 1; v-- {
+		history = append(history, render.VersionEntry{Version: v})
 	}
-	return protocol.Response{Status: protocol.StatusOK, Metadata: meta}, nil
+	return render.VersionsResponse(docPath, history, d.Meta["chain-valid"] != "false"), nil
 }
 
 func tagged(body string) fakeDoc {

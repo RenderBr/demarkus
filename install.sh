@@ -222,8 +222,8 @@ detect_platform() {
 
 # Parse version string into comparable integer: 1.2.3 -> 1002003
 version_num() {
-  local IFS='.'
-  local parts=($1)
+  local parts
+  IFS='.' read -r -a parts <<<"$1"
   echo $(( ${parts[0]:-0} * 1000000 + ${parts[1]:-0} * 1000 + ${parts[2]:-0} ))
 }
 
@@ -310,6 +310,38 @@ download_asset_file() {
   fi
 }
 
+# verify_sha256 exits unless file matches its entry in the checksums file.
+# Every unverifiable case is fatal: no file, no entry, no sha tool.
+verify_sha256() {
+  local file="$1" sums="$2"
+  local name expected actual
+  name=$(basename "$file")
+  if [ ! -f "$sums" ]; then
+    log_error "No checksums file for ${name}; refusing to install unverified"
+    exit 1
+  fi
+  expected=$(awk -v n="$name" '$2 == n || $2 == "*" n {print $1; exit}' "$sums")
+  if [ -z "$expected" ]; then
+    log_error "No checksum entry for ${name}; refusing to install unverified"
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$file" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  else
+    log_error "sha256sum or shasum is required to verify ${name}"
+    exit 1
+  fi
+  if [ "$expected" != "$actual" ]; then
+    log_error "Checksum mismatch for ${name}"
+    log_error "  Expected: $expected"
+    log_error "  Actual:   $actual"
+    exit 1
+  fi
+  log_info "Checksum verified"
+}
+
 download_and_verify() {
   local component="$1" # "server" or "client"
   local version="$2"
@@ -328,40 +360,12 @@ download_and_verify() {
   }
 
   download_asset_file "$tag" "$checksums_file" "${tmpdir}/${checksums_file}" || {
-    log_warn "Could not download checksums file, skipping verification"
-    tar xzf "${tmpdir}/${archive_file}" -C "${tmpdir}"
-    return 0
+    log_error "Failed to download ${checksums_file}"
+    exit 1
   }
 
-  log_info "Verifying checksum..."
-  local expected
-  expected=$(grep "${archive_file}" "${tmpdir}/${checksums_file}" | awk '{print $1}')
-  if [ -z "$expected" ]; then
-    log_warn "No checksum found for ${archive_file}, skipping verification"
-    tar xzf "${tmpdir}/${archive_file}" -C "${tmpdir}"
-    return 0
-  fi
+  verify_sha256 "${tmpdir}/${archive_file}" "${tmpdir}/${checksums_file}"
 
-  local actual
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "${tmpdir}/${archive_file}" | awk '{print $1}')
-  elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "${tmpdir}/${archive_file}" | awk '{print $1}')
-  else
-    log_warn "No sha256sum or shasum available, skipping verification"
-    tar xzf "${tmpdir}/${archive_file}" -C "${tmpdir}"
-    return 0
-  fi
-
-  if [ "$expected" != "$actual" ]; then
-    log_error "Checksum mismatch!"
-    log_error "  Expected: $expected"
-    log_error "  Actual:   $actual"
-    exit 1
-  fi
-  log_info "Checksum verified"
-
-  # Extract
   tar xzf "${tmpdir}/${archive_file}" -C "${tmpdir}"
 }
 
@@ -383,39 +387,16 @@ download_and_verify_asset() {
     exit 1
   }
 
-  # Checksums file may already be downloaded by a prior download_and_verify call
-  if [ -f "${tmpdir}/${checksums_file}" ]; then
-    log_info "Verifying checksum..."
-    local expected
-    expected=$(grep "${archive_file}" "${tmpdir}/${checksums_file}" | awk '{print $1}')
-    if [ -z "$expected" ]; then
-      log_warn "No checksum found for ${archive_file}, skipping verification"
-    else
-      local actual
-      if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "${tmpdir}/${archive_file}" | awk '{print $1}')
-      elif command -v shasum >/dev/null 2>&1; then
-        actual=$(shasum -a 256 "${tmpdir}/${archive_file}" | awk '{print $1}')
-      else
-        log_warn "No sha256sum or shasum available, skipping verification"
-        actual=""
-      fi
-
-      if [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
-        log_error "Checksum mismatch!"
-        log_error "  Expected: $expected"
-        log_error "  Actual:   $actual"
-        exit 1
-      fi
-      if [ -n "$actual" ]; then
-        log_info "Checksum verified"
-      fi
-    fi
-  else
-    log_warn "No checksums file available, skipping verification"
+  # A prior call for the same release may have fetched the checksums already.
+  if [ ! -f "${tmpdir}/${checksums_file}" ]; then
+    download_asset_file "$tag" "$checksums_file" "${tmpdir}/${checksums_file}" || {
+      log_error "Failed to download ${checksums_file}"
+      exit 1
+    }
   fi
 
-  # Extract
+  verify_sha256 "${tmpdir}/${archive_file}" "${tmpdir}/${checksums_file}"
+
   tar xzf "${tmpdir}/${archive_file}" -C "${tmpdir}"
 }
 
@@ -922,6 +903,87 @@ ensure_self_dial() {
 
 # --- Service management ---
 
+# server_exe_path prints the executable behind a pid, however it was started.
+# Linux reads /proc; macOS ps prints the full path as the command name.
+server_exe_path() {
+  local pid="$1" exe=""
+  # -L, not -e: the link of a replaced or unlinked binary dangles.
+  if [ -L "/proc/${pid}/exe" ]; then
+    exe=$($SUDO readlink "/proc/${pid}/exe" 2>/dev/null || true)
+    exe="${exe% (deleted)}"
+  else
+    exe=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+  fi
+  printf '%s\n' "$exe"
+}
+
+# resolved_path prints path with its directory symlinks resolved.
+resolved_path() {
+  local dir
+  dir=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P) || { printf '%s\n' "$1"; return 0; }
+  printf '%s/%s\n' "$dir" "$(basename "$1")"
+}
+
+# installed_server_pids lists servers running the INSTALL_DIR binary, by
+# executable rather than argv[0]: a PATH start has a bare name, and a name
+# match alone would hit the plugin managed server under ~/.demarkus/bin.
+installed_server_pids() {
+  local want pid exe
+  want=$(resolved_path "${INSTALL_DIR}/demarkus-server")
+  for pid in $( { pgrep -x demarkus-server; pgrep -f '(^|/)demarkus-server( |$)'; } 2>/dev/null | sort -un); do
+    exe=$(server_exe_path "$pid")
+    if [ -z "$exe" ]; then
+      # Gone between pgrep and the lookup is fine; alive and unreadable is
+      # not: skipping it could replace the binary under a running server.
+      ps -p "$pid" >/dev/null 2>&1 || continue
+      log_error "Cannot inspect process ${pid}; cannot tell whether it runs ${want}"
+      return 1
+    fi
+    if [ "$(resolved_path "$exe")" = "$want" ]; then
+      echo "$pid"
+    fi
+  done
+}
+
+# stop_installed_server ends leftovers the service manager did not stop:
+# TERM, then KILL. Returns 1 when one survives both or cannot be inspected.
+stop_installed_server() {
+  local pids wait_count=0
+  pids=$(installed_server_pids) || return 1
+  [ -n "$pids" ] || return 0
+  # shellcheck disable=SC2086  # a pid list, split on purpose
+  $SUDO kill $pids 2>/dev/null || true
+  while [ "$wait_count" -lt "${SERVER_WAIT_SECONDS:-5}" ]; do
+    pids=$(installed_server_pids) || return 1
+    [ -n "$pids" ] || return 0
+    sleep 1
+    wait_count=$((wait_count + 1))
+  done
+  # shellcheck disable=SC2086  # a pid list, split on purpose
+  $SUDO kill -9 $pids 2>/dev/null || true
+  sleep 1
+  pids=$(installed_server_pids) || return 1
+  [ -z "$pids" ]
+}
+
+# verify_server_running needs two good probes a second apart, so a server
+# that starts and dies at once does not pass.
+verify_server_running() {
+  local tries=0 streak=0 pids
+  while [ "$tries" -lt "${SERVER_WAIT_SECONDS:-10}" ]; do
+    if [ "$PLATFORM" = "linux" ]; then
+      if $SUDO systemctl is-active --quiet demarkus; then streak=$((streak + 1)); else streak=0; fi
+    else
+      # A failed inspection is not proof the server runs.
+      if pids=$(installed_server_pids) && [ -n "$pids" ]; then streak=$((streak + 1)); else streak=0; fi
+    fi
+    [ "$streak" -ge 2 ] && return 0
+    sleep 1
+    tries=$((tries + 1))
+  done
+  return 1
+}
+
 setup_systemd() {
   local content_root="$1"
   local tokens_file="$2"
@@ -1043,7 +1105,12 @@ EOF
   else
     launchctl load "$plist_file" 2>/dev/null || true
   fi
-  log_info "Service loaded (logs: ${log_dir}/)"
+  # The load calls fail for an already loaded service, so the process decides.
+  if ! verify_server_running; then
+    log_error "Service did not start (logs: ${log_dir}/)"
+    return 1
+  fi
+  log_info "Service running (logs: ${log_dir}/)"
 }
 
 # --- Existing config detection ---
@@ -1260,7 +1327,7 @@ install_broker() {
   # the admin-CLI tools stream.
   download_asset_file "broker/v${broker_version}" "demarkus-broker_checksums.txt" \
     "${tmpdir}/demarkus-broker_checksums.txt" 2>/dev/null \
-    || log_warn "Could not download broker checksums; verification will be skipped"
+    || { log_error "Could not download broker checksums"; exit 1; }
   download_and_verify_asset "$BROKER_SERVICE" "$broker_version" "broker" "$tmpdir"
   # Atomic replace: after a migration the broker may already be running,
   # and cp onto a live executable fails with ETXTBSY.
@@ -1446,14 +1513,11 @@ fetch_library_binary() {
     log_error "Could not download ${lib_asset}"
     exit 1
   fi
-  if curl -fsSL "${CURL_TIMEOUT_ARGS[@]}" "https://github.com/${LIBRARY_REPO}/releases/download/v${lib_version}/demarkus-library_checksums.txt" -o "${tmpdir}/demarkus-library_checksums.txt"; then
-    (cd "$tmpdir" && grep "$lib_asset" demarkus-library_checksums.txt | sha256sum -c - >/dev/null) || {
-      log_error "Checksum verification failed for ${lib_asset}"
-      exit 1
-    }
-  else
-    log_warn "Could not download library checksums; skipping verification"
+  if ! curl -fsSL "${CURL_TIMEOUT_ARGS[@]}" "https://github.com/${LIBRARY_REPO}/releases/download/v${lib_version}/demarkus-library_checksums.txt" -o "${tmpdir}/demarkus-library_checksums.txt"; then
+    log_error "Could not download library checksums"
+    exit 1
   fi
+  verify_sha256 "${tmpdir}/${lib_asset}" "${tmpdir}/demarkus-library_checksums.txt"
   tar -xzf "${tmpdir}/${lib_asset}" -C "$tmpdir" demarkus-library
   install_binary_atomic "${tmpdir}/demarkus-library" "${INSTALL_DIR}/demarkus-library"
   _LIBRARY_VERSION="$lib_version"
@@ -1835,7 +1899,9 @@ do_install() {
   fi
 
   # Stop service before binary replacement (avoids "Text file busy")
-  if pgrep -x demarkus-server >/dev/null 2>&1; then
+  local running_pids
+  running_pids=$(installed_server_pids) || exit 1
+  if [ -n "$running_pids" ]; then
     log_info "Stopping running service before replacing binaries"
     if [ "$PLATFORM" = "linux" ]; then
       $SUDO systemctl stop demarkus 2>/dev/null || true
@@ -1851,21 +1917,10 @@ do_install() {
         fi
       fi
     fi
-    # Wait for process to exit, escalate if needed
-    local wait_count=0
-    while pgrep -x demarkus-server >/dev/null 2>&1 && [ $wait_count -lt 5 ]; do
-      sleep 1
-      wait_count=$((wait_count + 1))
-    done
-    # SIGTERM if still running (handles manually started processes)
-    if pgrep -x demarkus-server >/dev/null 2>&1; then
-      $SUDO pkill -x demarkus-server 2>/dev/null || true
-      sleep 2
-    fi
-    # SIGKILL as last resort
-    if pgrep -x demarkus-server >/dev/null 2>&1; then
-      $SUDO pkill -9 -x demarkus-server 2>/dev/null || true
-      sleep 1
+    # Handles manually started processes the service manager does not own.
+    if ! stop_installed_server; then
+      log_error "Could not stop ${INSTALL_DIR}/demarkus-server"
+      exit 1
     fi
   fi
 
@@ -1904,7 +1959,7 @@ do_install() {
   # can verify each per-binary archive against it.
   download_asset_file "tools/v${tools_version}" "demarkus-tools_checksums.txt" \
     "${_TMPDIR}/demarkus-tools_checksums.txt" 2>/dev/null \
-    || log_warn "Could not download tools checksums; per-binary verification will be skipped"
+    || { log_error "Could not download tools checksums"; exit 1; }
   download_and_verify_asset "demarkus-token" "$tools_version" "tools" "$_TMPDIR"
   install_binaries "$_TMPDIR" "demarkus-token"
   download_and_verify_asset "demarkus-publish" "$tools_version" "tools" "$_TMPDIR"
@@ -2351,7 +2406,7 @@ update_stack_component() {
       fi
       download_asset_file "broker/v${version}" "demarkus-broker_checksums.txt" \
         "${tmpdir}/demarkus-broker_checksums.txt" 2>/dev/null \
-        || log_warn "Could not download broker checksums; verification will be skipped"
+        || { log_error "Could not download broker checksums"; exit 1; }
       download_and_verify_asset "$binary" "$version" "broker" "$tmpdir"
       install_binary_atomic "${tmpdir}/${binary}" "${INSTALL_DIR}/${binary}"
       log_info "${binary} updated to ${version}"
@@ -2420,7 +2475,7 @@ _do_update_inner() {
   if [ -n "$tools_version" ]; then
     download_asset_file "tools/v${tools_version}" "demarkus-tools_checksums.txt" \
       "${_TMPDIR}/demarkus-tools_checksums.txt" 2>/dev/null \
-      || log_warn "Could not download tools checksums; per-binary verification will be skipped"
+      || { log_error "Could not download tools checksums"; exit 1; }
     download_and_verify_asset "demarkus-token" "$tools_version" "tools" "$_TMPDIR"
     download_and_verify_asset "demarkus-publish" "$tools_version" "tools" "$_TMPDIR"
   else
@@ -2438,9 +2493,6 @@ _do_update_inner() {
   # Stop service before replacing binaries (avoids "Text file busy")
   if [ "$PLATFORM" = "linux" ]; then
     $SUDO systemctl stop demarkus 2>/dev/null || true
-    sleep 1
-    $SUDO pkill -f demarkus-server 2>/dev/null || true
-    sleep 1
   elif [ "$PLATFORM" = "darwin" ]; then
     local plist="$HOME/Library/LaunchAgents/io.latebit.demarkus.plist"
     if [ -f "$plist" ]; then
@@ -2452,8 +2504,10 @@ _do_update_inner() {
         launchctl unload "$plist" 2>/dev/null || true
       fi
     fi
-    pkill -f demarkus-server 2>/dev/null || true
-    sleep 1
+  fi
+  if ! stop_installed_server; then
+    log_error "Could not stop ${INSTALL_DIR}/demarkus-server"
+    exit 1
   fi
 
   # Replace binaries
@@ -2468,12 +2522,17 @@ _do_update_inner() {
     install_binaries "$_TMPDIR" "demarkus-publish"
   fi
 
-  # Restart service
+  # Restart service. A host with no unit or plist runs the server by hand.
+  local server_managed=false
   if [ "$PLATFORM" = "linux" ]; then
-    $SUDO systemctl restart demarkus 2>/dev/null || log_warn "Could not restart service"
+    if $SUDO test -f "${SYSTEMD_DIR}/demarkus.service"; then
+      server_managed=true
+      $SUDO systemctl restart demarkus 2>/dev/null || log_warn "Could not restart service"
+    fi
   elif [ "$PLATFORM" = "darwin" ]; then
     local plist="$HOME/Library/LaunchAgents/io.latebit.demarkus.plist"
     if [ -f "$plist" ]; then
+      server_managed=true
       local macos_major
       macos_major=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
       if [ "${macos_major:-0}" -ge 14 ] 2>/dev/null; then
@@ -2560,6 +2619,12 @@ RestrictSUIDSGID=yes
     echo "$to" > "${CONFIG_DIR}/version"
   else
     echo "$to" | $SUDO tee "${CONFIG_DIR}/version" > /dev/null
+  fi
+
+  # Checked last so the hardening restart above is covered too.
+  if [ "$server_managed" = true ] && ! verify_server_running; then
+    log_error "Binaries updated to v${to} but demarkus-server is not running"
+    exit 1
   fi
 
   log_step "Updated to v${to}"

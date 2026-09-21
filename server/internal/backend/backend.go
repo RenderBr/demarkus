@@ -2,42 +2,88 @@
 package backend
 
 import (
-	"time"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 
-	protocolstore "github.com/latebit-io/demarkus/protocol/store"
+	"github.com/latebit-io/demarkus/protocol/storefmt"
 	"github.com/latebit-io/demarkus/server/internal/catalog"
 )
 
-// Reader exposes one committed document-store snapshot.
-type Reader interface {
-	Get(reqPath string, version int) (*protocolstore.Document, error)
-	// ListEntries returns unique immediate children in strictly increasing Name order.
-	ListEntries(reqPath string, includeArchived bool) ([]protocolstore.DirEntry, error)
-	IsDir(reqPath string) (bool, error)
-	Versions(reqPath string) ([]protocolstore.VersionInfo, error)
-	LookupHashResult(hash string) (string, error)
-	VerifyChain(reqPath string) error
+// Refusals a backend reports without the handler knowing the backend.
+var (
+	// ErrQuota means the write would pass a configured limit.
+	ErrQuota = errors.New("quota exceeded")
+	// ErrRejected means the store refused a write the publisher can correct.
+	ErrRejected = errors.New("write rejected")
+)
+
+// Rejection is an ErrRejected that carries its reason for the response body.
+type Rejection interface {
+	error
+	RejectionMessage() string
 }
 
-// Store is the mutable document-store contract.
+// ErrNotFound means the path, version or hash names nothing a reader may see.
+var ErrNotFound = errors.New("not found")
+
+// FromNotExist marks a backend's own missing-file error as ErrNotFound, keeping
+// the cause in the chain.
+func FromNotExist(err error) error {
+	if err != nil && errors.Is(err, fs.ErrNotExist) && !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("%w: %w", ErrNotFound, err)
+	}
+	return err
+}
+
+// Reader exposes one committed document-store snapshot.
+type Reader interface {
+	Get(ctx context.Context, reqPath string, version int) (*storefmt.Document, error)
+	// ListEntries returns unique immediate children in strictly increasing Name
+	// order, windowed by opts before any per entry work.
+	ListEntries(ctx context.Context, reqPath string, opts storefmt.ListOptions) ([]storefmt.DirEntry, error)
+	IsDir(ctx context.Context, reqPath string) (bool, error)
+	Versions(ctx context.Context, reqPath string) ([]storefmt.VersionInfo, error)
+	LookupHash(ctx context.Context, hash string) (string, error)
+	VerifyChain(ctx context.Context, reqPath string) error
+}
+
+// WriteRequest is one PUBLISH or APPEND. ExpectedVersion is the version the
+// writer last saw; a negative value skips the check.
+type WriteRequest struct {
+	Path            string
+	ExpectedVersion int
+	Content         []byte
+	Metadata        map[string]string
+	// Precondition, when set, judges the write inside the commit.
+	Precondition Precondition
+}
+
+// Precondition runs after the conflict, archive and no-op checks and before
+// anything is stored. state is what the write commits against. Its error refuses
+// the write and is returned as is; a retried commit runs it again.
+type Precondition func(ctx context.Context, state Reader, write storefmt.PreparedWrite) error
+
+// ArchiveResult is the document after an archive transition; Changed is false
+// when it already had the requested state.
+type ArchiveResult struct {
+	Document *storefmt.Document
+	Changed  bool
+}
+
+// Store is the document-store contract: reads go through a view, writes are
+// atomic and keep the LOOKUP catalog current.
 type Store interface {
-	Reader
-	CurrentVersionResult(reqPath string) (int, error)
-	WriteVersion(reqPath string, expectedVersion int, content []byte, meta map[string]string) (*protocolstore.Document, error)
-	Append(reqPath string, expectedVersion int, content []byte, meta map[string]string) (*protocolstore.Document, error)
-	ArchiveResult(reqPath string, archived bool) (*protocolstore.Document, bool, error)
+	ViewProvider
+	Publish(ctx context.Context, req WriteRequest) (*storefmt.Document, error)
+	Append(ctx context.Context, req WriteRequest) (*storefmt.Document, error)
+	SetArchived(ctx context.Context, reqPath string, archived bool) (ArchiveResult, error)
 }
 
 // CatalogReader exposes LOOKUP against the same snapshot as Reader.
 type CatalogReader interface {
-	Lookup(query string, opts catalog.Options) ([]catalog.Result, error)
-}
-
-// Catalog is the mutable LOOKUP contract.
-type Catalog interface {
-	CatalogReader
-	Put(docPath string, meta map[string]string, body []byte, modified time.Time)
-	Remove(docPath string)
+	Lookup(ctx context.Context, query string, opts catalog.Options) ([]catalog.Result, error)
 }
 
 // ReadView pins all read surfaces to one committed backend snapshot.
@@ -47,7 +93,7 @@ type ReadView interface {
 	Close() error
 }
 
-// ViewProvider opens one request-scoped snapshot.
+// ViewProvider opens one request-scoped snapshot; ctx bounds acquiring it.
 type ViewProvider interface {
-	OpenReadView() (ReadView, error)
+	OpenReadView(ctx context.Context) (ReadView, error)
 }

@@ -30,9 +30,9 @@ import (
 
 	"github.com/latebit-io/demarkus/client/fetch"
 	"github.com/latebit-io/demarkus/protocol"
-	"github.com/latebit-io/demarkus/protocol/token"
 	"github.com/latebit-io/demarkus/tools/demarkus-plugin/internal/config"
 	"github.com/latebit-io/demarkus/tools/demarkus-plugin/internal/lockdir"
+	"github.com/latebit-io/demarkus/tools/internal/token"
 )
 
 // Version pins for the SEPARATE server/client modules (their own release
@@ -697,7 +697,9 @@ func ensureTokenEntry(root, tokensTOML string) error {
 		// Reassert 0600 on the idempotent path: an existing token left
 		// world/group-readable (e.g. from an older install) would otherwise stay
 		// exposed forever since we return without regenerating.
-		_ = os.Chmod(tokenFile, 0o600)
+		if err := os.Chmod(tokenFile, 0o600); err != nil {
+			return fmt.Errorf("restrict token file %s: %w", tokenFile, err)
+		}
 		return nil
 	}
 
@@ -844,7 +846,7 @@ func portIsFree(port int) bool {
 		}
 		return true // permissive on any other probe failure
 	}
-	_ = conn.Close()
+	_ = conn.Close() // probe connection; the dial result is the answer
 	return true
 }
 
@@ -925,6 +927,7 @@ func tokensFromArgv(argv []string) string {
 // pidOfServerAtRoot returns the PID of a demarkus-server whose -root flag (or
 // DEMARKUS_ROOT env) equals root (literal match), or 0 when none match.
 func pidOfServerAtRoot(root string) int {
+	// For callers that treat "could not look" as "none"; others use the probed form.
 	pid, _ := pidOfServerAtRootProbed(root)
 	return pid
 }
@@ -955,27 +958,43 @@ func pidOfServerAtRootProbed(root string) (int, bool) {
 	return 0, true
 }
 
-// pidIsServerAtRoot reports whether pid is a LIVE demarkus-server whose -root
-// flag (or DEMARKUS_ROOT env) equals root. This is the ownership check that makes
-// reusing/killing a recorded .pid safe: a stale .pid whose number has been reused
-// by an unrelated process must never be treated as our managed server.
-func pidIsServerAtRoot(pid int, root string) bool {
-	if pid <= 0 {
-		return false
+// ownership is the answer to "is this pid our demarkus-server for root".
+type ownership int
+
+const (
+	ownershipNo      ownership = iota // dead, reused by another process, or another root
+	ownershipYes                      // live demarkus-server whose root matches
+	ownershipUnknown                  // the process probe did not run; decide nothing
+)
+
+// probeServerAtRoot is the ownership check that makes reusing or killing a
+// recorded .pid safe. A probe that could not run is unknown, never "not ours".
+func probeServerAtRoot(pid int, root string) ownership {
+	if pid <= 0 || !lockdir.PidAlive(pid) {
+		return ownershipNo
 	}
-	if !lockdir.PidAlive(pid) {
-		return false
+	args, ran := psArgs(pid)
+	if !ran {
+		return ownershipUnknown
 	}
-	args, _ := psArgs(pid)
 	if !strings.Contains(args, "demarkus-server") {
-		return false
+		return ownershipNo
 	}
 	if argsRootMatches(args, root) {
-		return true
+		return ownershipYes
 	}
-	env, _ := procEnv(pid, "DEMARKUS_ROOT")
-	return env == root
+	env, ran := procEnv(pid, "DEMARKUS_ROOT")
+	if !ran {
+		return ownershipUnknown
+	}
+	if env == root {
+		return ownershipYes
+	}
+	return ownershipNo
 }
+
+// errOwnershipUnknown aborts a lifecycle step rather than guess about a live pid.
+var errOwnershipUnknown = errors.New("cannot verify the recorded server pid: process probe did not complete; retry")
 
 // argsRootMatches mirrors the bash literal substring match for "-root TARGET" /
 // "-root=TARGET" at a word boundary, handling paths with regex metacharacters or
@@ -1009,6 +1028,7 @@ func findRunningDemarkus() (string, bool) {
 		port := portOfServer(args, pid)
 		root := flagValue(args, rootFlagRe)
 		if root == "" {
+			// An unreadable environment lists as "(unknown)" below.
 			root, _ = procEnv(pid, "DEMARKUS_ROOT")
 		}
 		if root == "" {
@@ -1036,23 +1056,29 @@ func portOfServer(args string, pid int) string {
 // managedServerCurrent reports whether the managed server recorded in pidFile is
 // alive, is genuinely OUR demarkus-server for root (not a reused PID), AND the
 // binary version stamped in versionFile matches the current serverVersion pin.
-func managedServerCurrent(pidFile, versionFile, root string) bool {
-	pid := readPID(pidFile)
-	if pid <= 0 {
-		return false
+func managedServerCurrent(pidFile, versionFile, root string) (bool, error) {
+	switch probeServerAtRoot(readPID(pidFile), root) {
+	case ownershipUnknown:
+		return false, errOwnershipUnknown
+	case ownershipNo:
+		return false, nil
 	}
-	if !pidIsServerAtRoot(pid, root) {
-		return false
+	// A missing stamp reads as not current, which restarts onto the pinned binary.
+	ver, err := os.ReadFile(versionFile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("read %s: %w", versionFile, err)
 	}
-	ver, _ := os.ReadFile(versionFile)
-	return strings.TrimSpace(string(ver)) == serverVersion
+	return strings.TrimSpace(string(ver)) == serverVersion, nil
 }
 
 // stopStaleManagedServer stops a live-but-stale managed server and confirms it
 // exited: the caller's token migration moves the file the old server reads. A
 // live PID that is not our server for memoryDir is left untouched (kill safety).
 func stopStaleManagedServer(runningPID int, memoryDir string) error {
-	if !pidIsServerAtRoot(runningPID, memoryDir) {
+	switch probeServerAtRoot(runningPID, memoryDir) {
+	case ownershipUnknown:
+		return errOwnershipUnknown
+	case ownershipNo:
 		if runningPID > 0 && lockdir.PidAlive(runningPID) {
 			warnf("recorded pid %d is live but is not the demarkus-server for %s (stale .pid, reused PID); leaving it alone and clearing our bookkeeping", runningPID, memoryDir)
 		}
@@ -1081,6 +1107,24 @@ func stopStaleManagedServer(runningPID int, memoryDir string) error {
 	return nil
 }
 
+// retireStaleServer reports a current managed server, or stops a stale one of
+// ours and clears its bookkeeping. An unknown probe aborts before touching either.
+func retireStaleServer(pidFile, versionFile, memoryDir string) (bool, error) {
+	current, err := managedServerCurrent(pidFile, versionFile, memoryDir)
+	if err != nil || current {
+		return current, err
+	}
+	if err := stopStaleManagedServer(readPID(pidFile), memoryDir); err != nil {
+		return false, err
+	}
+	for _, f := range []string{pidFile, versionFile} {
+		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			warnf("could not clear stale bookkeeping file %s: %v", f, err)
+		}
+	}
+	return false, nil
+}
+
 // ensureManagedServer spawns a demarkus-server for memoryDir unless ours is
 // already running and current (default/isolated modes only). A recorded PID is
 // killed only once confirmed to be our server for this root; a stale PID is left alone.
@@ -1088,19 +1132,9 @@ func ensureManagedServer(memoryDir string, port int) error {
 	pidFile := filepath.Join(memoryDir, ".pid")
 	versionFile := filepath.Join(memoryDir, ".server-version")
 
-	if managedServerCurrent(pidFile, versionFile, memoryDir) {
-		return nil
-	}
-
-	// Not reusable. Stop a live-but-stale managed server before respawning — but
-	// only after confirming it is genuinely ours for this root.
-	if err := stopStaleManagedServer(readPID(pidFile), memoryDir); err != nil {
+	current, err := retireStaleServer(pidFile, versionFile, memoryDir)
+	if err != nil || current {
 		return err
-	}
-	for _, f := range []string{pidFile, versionFile} {
-		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
-			warnf("could not clear stale bookkeeping file %s: %v", f, err)
-		}
 	}
 	// Pre-#289 the log sat at <memoryDir>/.log, inside the server's tokens-watch
 	// directory, feeding the watcher its own output. Remove it on migration.
@@ -1936,8 +1970,10 @@ func HealthWarning() (string, error) {
 		// Verify the recorded PID is genuinely OUR demarkus-server for this root,
 		// not just any live process that reused the number — otherwise a stale
 		// .pid would falsely report healthy while memory tools fail.
-		pid := readPID(filepath.Join(cfg.MemoryDir, ".pid"))
-		if pid <= 0 || !pidIsServerAtRoot(pid, cfg.MemoryDir) {
+		switch probeServerAtRoot(readPID(filepath.Join(cfg.MemoryDir, ".pid")), cfg.MemoryDir) {
+		case ownershipUnknown:
+			return fmt.Sprintf("cannot tell whether the demarkus-memory server for %s is running: process discovery did not complete. Run /soul-status to retry.", cfg.MemoryDir), nil
+		case ownershipNo:
 			return fmt.Sprintf("the demarkus-memory server is not running (no live process for %s). Memory tools (mark_fetch/mark_publish/mark_lookup/...) will fail until it restarts; run /soul-init to restart, or /soul-status to diagnose.", cfg.MemoryDir), nil
 		}
 	case "reuse":

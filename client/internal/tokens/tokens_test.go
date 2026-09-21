@@ -1,8 +1,11 @@
 package tokens
 
 import (
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -154,28 +157,34 @@ func TestResolve(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
+	const origin = "localhost:6309"
+	if err := s.Set("other.example:6309", "other-stored"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
 	tests := []struct {
-		name     string
-		explicit string
-		host     string
-		envVal   string
-		store    *Store
-		want     string
+		name   string
+		cred   Credential
+		host   string
+		envVal string
+		store  *Store
+		want   string
 	}{
-		{"explicit wins", "flag-token", "localhost:6309", "", s, "flag-token"},
-		{"env wins over store", "", "localhost:6309", "env-token", s, "env-token"},
-		{"store fallback", "", "localhost:6309", "", s, "stored-token"},
-		{"nil store", "", "localhost:6309", "", nil, ""},
-		{"unknown host", "", "unknown:6309", "", s, ""},
-		{"explicit wins even with env", "flag-token", "localhost:6309", "env-token", s, "flag-token"},
+		{"explicit wins", Credential{Explicit: "flag-token", Origin: origin}, origin, "", s, "flag-token"},
+		{"env wins over store", Credential{Origin: origin}, origin, "env-token", s, "env-token"},
+		{"store fallback", Credential{Origin: origin}, origin, "", s, "stored-token"},
+		{"nil store", Credential{Origin: origin}, origin, "", nil, ""},
+		{"unknown host", Credential{Origin: origin}, "unknown:6309", "", s, ""},
+		{"explicit wins even with env", Credential{Explicit: "flag-token", Origin: origin}, origin, "env-token", s, "flag-token"},
+		{"explicit never reaches a foreign host", Credential{Explicit: "flag-token", Origin: origin}, "evil.example:6309", "", s, ""},
+		{"env never reaches a foreign host", Credential{Origin: origin}, "evil.example:6309", "env-token", s, ""},
+		{"foreign host still gets its stored token", Credential{Explicit: "flag-token", Origin: origin}, "other.example:6309", "env-token", s, "other-stored"},
+		{"no origin scopes flag and env to no host", Credential{Explicit: "flag-token"}, origin, "env-token", s, "stored-token"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("DEMARKUS_AUTH", "")
-			if tt.envVal != "" {
-				t.Setenv("DEMARKUS_AUTH", tt.envVal)
-			}
-			got := Resolve(tt.explicit, tt.host, tt.store)
+			t.Setenv("DEMARKUS_AUTH", tt.envVal)
+			got := Resolve(tt.cred, tt.host, tt.store)
 			if got != tt.want {
 				t.Errorf("Resolve() = %q, want %q", got, tt.want)
 			}
@@ -217,5 +226,67 @@ func TestSave_CreatesDirectory(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Errorf("file permissions: got %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestLoadDefaultReportsBrokenFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".mark"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".mark", "tokens.toml"), []byte("not [valid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logged []string
+	warnf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	t.Cleanup(func() { warnf = log.Printf })
+
+	if s := LoadDefault(); s == nil || s.Get("any:6309") != "" {
+		t.Fatalf("want an empty store, got %v", s)
+	}
+	if len(logged) != 1 || !strings.Contains(logged[0], "tokens.toml") {
+		t.Errorf("logged = %q, want one line naming the file", logged)
+	}
+}
+
+// A reader racing a save must never see a truncated, empty file.
+func TestSaveNeverExposesEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens.toml")
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set("keep:6309", "tok"); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		for i := range 200 {
+			if err := s.Set("churn:6309", fmt.Sprint(i)); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		default:
+		}
+		r, err := Load(path)
+		if err != nil {
+			t.Fatalf("load during save: %v", err)
+		}
+		if r.Get("keep:6309") != "tok" {
+			t.Fatal("reader saw a store without the kept token")
+		}
 	}
 }

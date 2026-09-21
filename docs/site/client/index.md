@@ -34,6 +34,8 @@ demarkus --insecure -X VERSIONS mark://localhost:6309/hello.md
 demarkus --insecure mark://localhost:6309/hello.md/v1
 ```
 
+The exit code is 0 for `ok`, `created` and `not-modified`. Any other status, a conflict or a missing document for example, still prints the response body and exits 1, so scripts can detect a refused request.
+
 ### Edit a document
 
 Opens a document in `$EDITOR` (falls back to `vi`), then publishes changes when you exit the editor. If the document doesn't exist, creates a new one. Empty documents are rejected.
@@ -124,7 +126,7 @@ The 15 registered tools are `mark_fetch`, `mark_list`, `mark_explore`, `mark_ver
 
 ## Accessing Private Servers
 
-All three clients support read authentication for servers with protected paths. Tokens are resolved in this order: explicit token flag (CLI: `-auth`, MCP: `-token`; TUI has no token flag) > `DEMARKUS_AUTH` env var > stored token from `~/.mark/tokens.toml`.
+All three clients support read authentication for servers with protected paths. Tokens are resolved in this order: explicit token flag (CLI: `-auth`, MCP: `-token`; TUI has no token flag) > `DEMARKUS_AUTH` env var > stored token from `~/.mark/tokens.toml`. The flag and `DEMARKUS_AUTH` are sent to one host only: the server you named (CLI), the first server you open (TUI), or the `-host` server (MCP). Servers reached through links or crawls receive only their own stored token.
 
 ### Store a token once
 
@@ -157,14 +159,14 @@ The TUI loads tokens fresh on each navigation, so tokens added via CLI while the
 ### MCP
 
 ```bash
-# Single token for all hosts
+# Token for the -host server only
 demarkus-mcp -host mark://private.example:6309 -token <raw-token> -insecure
 
 # Or rely on stored tokens (per-host resolution)
 demarkus-mcp -host mark://private.example:6309 -insecure
 ```
 
-The MCP server resolves tokens per-host: the `-token` flag takes precedence, then `DEMARKUS_AUTH`, then the stored token for the target host.
+The MCP server resolves tokens per-host: on the `-host` server the `-token` flag takes precedence, then `DEMARKUS_AUTH`; every other host gets only its stored token. Without `-host`, the flag and env var are unused.
 
 ## Related Tools
 

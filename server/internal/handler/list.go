@@ -5,18 +5,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/latebit-io/demarkus/protocol"
-	"github.com/latebit-io/demarkus/protocol/store"
+	"github.com/latebit-io/demarkus/protocol/render"
+	"github.com/latebit-io/demarkus/protocol/storefmt"
 )
 
 const (
 	listCursorVersion = byte(1)
 	listCursorArchive = byte(1)
-	listTruncatedNote = "\n*...truncated, too many entries*\n"
 )
 
 var errListPageCannotProgress = errors.New("one LIST entry exceeds the response size limit")
@@ -99,29 +98,26 @@ func decodeListCursor(encoded, reqPath string, includeArchived bool) (string, er
 	return after, nil
 }
 
-func buildDirectoryPage(reqPath string, entries []store.DirEntry, after string, pageSize int) (directoryPage, error) {
-	for i := 1; i < len(entries); i++ {
-		if entries[i-1].Name >= entries[i].Name {
+// buildDirectoryPage renders entries, already windowed past the cursor, up to
+// pageSize and the body limit; anything left over makes the page incomplete.
+func buildDirectoryPage(reqPath string, entries []storefmt.DirEntry, pageSize int) (directoryPage, error) {
+	for i, entry := range entries {
+		if i > 0 && entries[i-1].Name >= entry.Name {
 			return directoryPage{}, errors.New("LIST entries are not strictly ordered")
 		}
 	}
 
-	displayPath := reqPath
-	if displayPath != "/" && !strings.HasSuffix(displayPath, "/") {
-		displayPath += "/"
-	}
 	var body strings.Builder
-	body.WriteString("\n# Index of " + escapeMD(displayPath) + "\n\n")
+	body.WriteString(render.IndexHeading(reqPath))
 
-	start := sort.Search(len(entries), func(i int) bool { return entries[i].Name > after })
 	page := directoryPage{}
-	next := start
+	next := 0
 	for next < len(entries) && page.EntryCount < pageSize {
-		line := directoryEntryLine(entries[next])
+		line := render.EntryLine(entries[next].Name, entries[next].IsDir)
 		moreAfter := next+1 < len(entries)
 		reserve := 0
 		if moreAfter {
-			reserve = len(listTruncatedNote)
+			reserve = len(render.ListTruncatedNote)
 		}
 		if body.Len()+len(line)+reserve > protocol.MaxBodyLength {
 			if page.EntryCount == 0 {
@@ -136,17 +132,8 @@ func buildDirectoryPage(reqPath string, entries []store.DirEntry, after string, 
 	}
 	page.Complete = next == len(entries)
 	if !page.Complete {
-		body.WriteString(listTruncatedNote)
+		body.WriteString(render.ListTruncatedNote)
 	}
 	page.Body = body.String()
 	return page, nil
-}
-
-func directoryEntryLine(entry store.DirEntry) string {
-	display := escapeMD(entry.Name)
-	link := escapeURL(entry.Name)
-	if entry.IsDir {
-		return "- [" + display + "/](" + link + "/)\n"
-	}
-	return "- [" + display + "](" + link + ")\n"
 }

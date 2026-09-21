@@ -52,6 +52,22 @@ func TestRuntimeServesHealthAndClosesBackendOnce(t *testing.T) {
 	}
 }
 
+// A client that stops reading must not hold the read view and a slot forever.
+func TestRuntimeBoundsResponseWrite(t *testing.T) {
+	timeout := 5 * time.Second
+	runtime := newTestRuntime(t, &Config{RequestTimeout: timeout})
+	stream := newTestStream("FETCH /health\n")
+	before := time.Now()
+	runtime.ServeStream(context.Background(), testAddr("127.0.0.1:1234"), stream)
+
+	stream.mu.Lock()
+	deadline := stream.writeDeadline
+	stream.mu.Unlock()
+	if deadline.Before(before.Add(timeout)) || deadline.After(time.Now().Add(timeout)) {
+		t.Errorf("write deadline = %v, want about %v from the request start", deadline, timeout)
+	}
+}
+
 func TestRuntimeRejectsStreamsAfterClose(t *testing.T) {
 	runtime := newTestRuntime(t, &Config{})
 	if err := runtime.Close(); err != nil {
@@ -171,6 +187,9 @@ func TestRuntimeLimitsConcurrentStreams(t *testing.T) {
 	if response.Status != protocol.StatusRateLimited {
 		t.Fatalf("status = %q, want %q", response.Status, protocol.StatusRateLimited)
 	}
+	if second.deadlineAtFirstWrite.IsZero() {
+		t.Error("concurrency refusal was written with no write deadline")
+	}
 	close(reader.release)
 	<-served
 	if err := runtime.Close(); err != nil {
@@ -250,8 +269,12 @@ func TestRuntimeOverQUIC(t *testing.T) {
 
 func TestWriteRateLimited(t *testing.T) {
 	stream := newTestStream("")
-	if err := writeRateLimited(stream); err != nil {
+	runtime := newTestRuntime(t, &Config{RequestTimeout: 5 * time.Second})
+	if err := runtime.writeRateLimited(stream); err != nil {
 		t.Fatalf("writeRateLimited: %v", err)
+	}
+	if stream.deadlineAtFirstWrite.IsZero() {
+		t.Error("early refusal was written with no write deadline")
 	}
 	response, err := protocol.ParseResponse(&stream.output)
 	if err != nil {
@@ -271,8 +294,6 @@ func newTestRuntime(t *testing.T, config *Config) *Runtime {
 	lookup := catalog.New()
 	store := filestore.New(documents, lookup)
 	config.Store = store
-	config.Catalog = store
-	config.Views = store
 	config.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	runtime, err := New(config)
 	if err != nil {
@@ -308,17 +329,35 @@ func writeFile(t *testing.T, path, content string) {
 
 type testStream struct {
 	io.Reader
-	output bytes.Buffer
-	mu     sync.Mutex
-	closed bool
+	output        bytes.Buffer
+	mu            sync.Mutex
+	closed        bool
+	writeDeadline time.Time
+	// deadlineAtFirstWrite is the write deadline in force when output began.
+	deadlineAtFirstWrite time.Time
+	wrote                bool
 }
 
 func newTestStream(request string) *testStream {
 	return &testStream{Reader: strings.NewReader(request)}
 }
 
-func (s *testStream) Write(p []byte) (int, error)     { return s.output.Write(p) }
+func (s *testStream) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	if !s.wrote {
+		s.wrote = true
+		s.deadlineAtFirstWrite = s.writeDeadline
+	}
+	s.mu.Unlock()
+	return s.output.Write(p)
+}
 func (s *testStream) SetReadDeadline(time.Time) error { return nil }
+func (s *testStream) SetWriteDeadline(deadline time.Time) error {
+	s.mu.Lock()
+	s.writeDeadline = deadline
+	s.mu.Unlock()
+	return nil
+}
 func (s *testStream) Close() error {
 	s.mu.Lock()
 	s.closed = true

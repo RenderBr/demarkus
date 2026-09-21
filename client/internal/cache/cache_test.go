@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/latebit-io/demarkus/protocol"
+	"github.com/latebit-io/demarkus/protocol/render"
 )
 
 func TestPutAndGet(t *testing.T) {
@@ -65,11 +66,7 @@ func TestListAndFetchSeparate(t *testing.T) {
 		Metadata: map[string]string{"version": "1"},
 		Body:     "# Index\n",
 	}
-	listResp := protocol.Response{
-		Status:   protocol.StatusOK,
-		Metadata: map[string]string{"entries": "3"},
-		Body:     "# Index of /\n\n- [a.md](a.md)\n",
-	}
+	listResp := render.ListResponse("/", []render.ListEntry{{Name: "a.md"}}, "")
 
 	if err := c.Put("localhost:6309", "/", protocol.VerbFetch, fetchResp); err != nil {
 		t.Fatalf("put fetch: %v", err)
@@ -93,7 +90,7 @@ func TestListAndFetchSeparate(t *testing.T) {
 	if fetchEntry.Response.Body != "# Index\n" {
 		t.Errorf("fetch body: got %q", fetchEntry.Response.Body)
 	}
-	if listEntry.Response.Body != "# Index of /\n\n- [a.md](a.md)\n" {
+	if listEntry.Response.Body != listResp.Body {
 		t.Errorf("list body: got %q", listEntry.Response.Body)
 	}
 }
@@ -308,5 +305,48 @@ func TestNestedPath(t *testing.T) {
 	}
 	if entry.Response.Metadata["version"] != "2" {
 		t.Errorf("version: got %q, want %q", entry.Response.Metadata["version"], "2")
+	}
+}
+
+// A crash between the two writes must leave the old etag, never a new etag
+// over the old body: the old etag revalidates and heals, the new one does not.
+func TestPutInterruptedKeepsOldEtag(t *testing.T) {
+	c := New(t.TempDir())
+	old := protocol.Response{Status: protocol.StatusOK, Metadata: map[string]string{"etag": "v1"}, Body: "old\n"}
+	if err := c.Put("h:6309", "/doc.md", protocol.VerbFetch, old); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+
+	renames := 0
+	renameFile = func(from, to string) error {
+		renames++
+		if renames == 2 {
+			return os.ErrPermission
+		}
+		return os.Rename(from, to)
+	}
+	t.Cleanup(func() { renameFile = os.Rename })
+
+	fresh := protocol.Response{Status: protocol.StatusOK, Metadata: map[string]string{"etag": "v2"}, Body: "new\n"}
+	if err := c.Put("h:6309", "/doc.md", protocol.VerbFetch, fresh); err == nil {
+		t.Fatal("put: want error from interrupted rename")
+	}
+
+	got, err := c.Get("h:6309", "/doc.md", protocol.VerbFetch)
+	if err != nil || got == nil {
+		t.Fatalf("get: entry=%v err=%v", got, err)
+	}
+	if etag := got.Response.Metadata["etag"]; etag != "v1" {
+		t.Errorf("etag = %q, want the old v1", etag)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(c.Dir, "h:6309", "doc.md"))
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() != ".fetch" && e.Name() != ".fetch.meta" {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
 	}
 }

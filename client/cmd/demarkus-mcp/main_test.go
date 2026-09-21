@@ -6,17 +6,16 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"path/filepath"
 
 	"github.com/latebit-io/demarkus/client/fetch"
+	"github.com/latebit-io/demarkus/client/fetchtest"
 	"github.com/latebit-io/demarkus/client/graph"
 	"github.com/latebit-io/demarkus/client/graphstore"
 	"github.com/latebit-io/demarkus/client/index"
-	"github.com/latebit-io/demarkus/client/links"
 	"github.com/latebit-io/demarkus/client/mcpfmt"
 	"github.com/latebit-io/demarkus/protocol"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -236,9 +235,9 @@ func TestHandlerMarkList_InvalidURL(t *testing.T) {
 func TestHandlerMarkListForwardsPagination(t *testing.T) {
 	var got fetch.ListOptions
 	h := &handler{client: &stubClient{
-		listOptsFn: func(_, _, _ string, opts fetch.ListOptions) (fetch.Result, error) {
+		ListOptsFn: func(_, _, _ string, opts fetch.ListOptions) (fetch.Result, error) {
 			got = opts
-			return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK}}, nil
+			return fetchtest.ListPage("/", ""), nil
 		},
 	}}
 	result, err := h.markList(t.Context(), newCallToolRequest(map[string]any{
@@ -263,7 +262,7 @@ func TestHandlerMarkListForwardsPagination(t *testing.T) {
 }
 
 func TestHandlerMarkListRejectsRepeatedCursor(t *testing.T) {
-	h := &handler{client: &stubClient{listOptsFn: func(_, _, _ string, _ fetch.ListOptions) (fetch.Result, error) {
+	h := &handler{client: &stubClient{ListOptsFn: func(_, _, _ string, _ fetch.ListOptions) (fetch.Result, error) {
 		return fetch.Result{Response: protocol.Response{
 			Status: protocol.StatusOK,
 			Metadata: map[string]string{
@@ -281,7 +280,7 @@ func TestHandlerMarkListRejectsRepeatedCursor(t *testing.T) {
 }
 
 func TestHandlerMarkListRejectsMissingContinuationCursor(t *testing.T) {
-	h := &handler{client: &stubClient{listOptsFn: func(_, _, _ string, _ fetch.ListOptions) (fetch.Result, error) {
+	h := &handler{client: &stubClient{ListOptsFn: func(_, _, _ string, _ fetch.ListOptions) (fetch.Result, error) {
 		return fetch.Result{Response: protocol.Response{
 			Status: protocol.StatusOK,
 			Metadata: map[string]string{
@@ -450,157 +449,13 @@ func TestHandlerMarkAppend_NoToken(t *testing.T) {
 	assertIsToolError(t, result, "requires a token")
 }
 
-// stubClient is a mock markClient for testing handler logic.
-type stubClient struct {
-	mu          sync.Mutex
-	published   map[string]fetch.Result
-	fetchFn     func(host, path, token string) (fetch.Result, error)
-	fetchCtxFn  func(context.Context, string, string, string) (fetch.Result, error)
-	fetchCondFn func(host, path, token, etag string) (fetch.Result, error)
-	snapshotFn  func(host, path, token, etag string) (fetch.Result, error)
-	listFn      func(host, path, token string) (fetch.Result, error)
-	listOptsFn  func(host, path, token string, opts fetch.ListOptions) (fetch.Result, error)
-	versionsFn  func(host, path, token string) (fetch.Result, error)
-	publishFn   func(host, path, body, token string, expectedVersion int, meta map[string]string) (fetch.Result, error)
-	appendFn    func(host, path, body, token string, expectedVersion int, meta map[string]string) (fetch.Result, error)
-	lookupFn    func(host, scope, query, token string, opts fetch.LookupOptions) (fetch.Result, error)
-}
-
-func (s *stubClient) Fetch(host, path, token string) (fetch.Result, error) {
-	s.mu.Lock()
-	stored, ok := s.published[host+path]
-	s.mu.Unlock()
-	if ok {
-		return stored, nil
-	}
-	if s.fetchFn != nil {
-		return s.fetchFn(host, path, token)
-	}
-	return fetch.Result{}, nil
-}
-
-func (s *stubClient) FetchContext(ctx context.Context, host, path, token string) (fetch.Result, error) {
-	if s.fetchCtxFn != nil {
-		return s.fetchCtxFn(ctx, host, path, token)
-	}
-	if err := ctx.Err(); err != nil {
-		return fetch.Result{}, err
-	}
-	return s.Fetch(host, path, token)
-}
-
-func (s *stubClient) FetchConditional(host, path, token, etag string) (fetch.Result, error) {
-	if path == graphstore.SnapshotManifestPath {
-		if s.snapshotFn != nil {
-			return s.snapshotFn(host, path, token, etag)
-		}
-		return fetch.Result{Response: protocol.Response{Status: protocol.StatusNotFound}}, nil
-	}
-	if s.fetchCondFn != nil {
-		return s.fetchCondFn(host, path, token, etag)
-	}
-	// Seed fetches against a stub with no graph.md behave like a missing doc.
-	return fetch.Result{Response: protocol.Response{Status: protocol.StatusNotFound}}, nil
-}
-
-func (s *stubClient) FetchConditionalContext(ctx context.Context, host, path, token, etag string) (fetch.Result, error) {
-	if err := ctx.Err(); err != nil {
-		return fetch.Result{}, err
-	}
-	return s.FetchConditional(host, path, token, etag)
-}
-func (s *stubClient) List(host, path, token string) (fetch.Result, error) {
-	if s.listFn != nil {
-		return s.listFn(host, path, token)
-	}
-	return fetch.Result{}, nil
-}
-
-func (s *stubClient) ListWithOptions(host, path, token string, opts fetch.ListOptions) (fetch.Result, error) {
-	if s.listOptsFn != nil {
-		return s.listOptsFn(host, path, token, opts)
-	}
-	result, err := s.List(host, path, token)
-	if err == nil && result.Response.Status == protocol.StatusOK && result.Response.Metadata["complete"] == "" {
-		if result.Response.Metadata == nil {
-			result.Response.Metadata = make(map[string]string)
-		}
-		result.Response.Metadata["entries"] = strconv.Itoa(len(links.Extract(result.Response.Body)))
-		result.Response.Metadata["complete"] = "true"
-	}
-	return result, err
-}
-func (s *stubClient) Publish(host, path, body, token string, expectedVersion int, meta map[string]string) (fetch.Result, error) {
-	if s.publishFn != nil {
-		result, err := s.publishFn(host, path, body, token, expectedVersion, meta)
-		if err != nil || (result.Response.Status != protocol.StatusOK && result.Response.Status != protocol.StatusCreated) {
-			return result, err
-		}
-		version, versionErr := strconv.Atoi(result.Response.Metadata["version"])
-		if versionErr == nil && version > 0 {
-			metadata := map[string]string{
-				"version":      strconv.Itoa(version),
-				"content-hash": index.BodyHash(body),
-			}
-			stored := fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: body, Metadata: metadata}}
-			s.mu.Lock()
-			currentVersion := 0
-			current, exists := s.published[host+path]
-			if exists {
-				currentVersion, versionErr = strconv.Atoi(current.Response.Metadata["version"])
-				if versionErr != nil {
-					s.mu.Unlock()
-					return fetch.Result{}, fmt.Errorf("invalid stub version: %w", versionErr)
-				}
-			}
-			if expectedVersion >= 0 && expectedVersion != currentVersion {
-				s.mu.Unlock()
-				return fetch.Result{Response: protocol.Response{Status: protocol.StatusConflict}}, nil
-			}
-			if s.published == nil {
-				s.published = make(map[string]fetch.Result)
-			}
-			s.published[host+path] = stored
-			s.published[host+index.VersionPath(path, version)] = stored
-			s.mu.Unlock()
-		}
-		return result, nil
-	}
-	return fetch.Result{}, nil
-}
-
-func (s *stubClient) PublishContext(ctx context.Context, host, path, body, token string, expectedVersion int, meta map[string]string) (fetch.Result, error) {
-	if err := ctx.Err(); err != nil {
-		return fetch.Result{}, err
-	}
-	return s.Publish(host, path, body, token, expectedVersion, meta)
-}
-func (s *stubClient) Archive(_, _, _ string) (fetch.Result, error) {
-	return fetch.Result{}, nil
-}
-func (s *stubClient) Versions(host, path, token string) (fetch.Result, error) {
-	if s.versionsFn != nil {
-		return s.versionsFn(host, path, token)
-	}
-	return fetch.Result{}, nil
-}
-func (s *stubClient) Append(host, path, body, token string, expectedVersion int, meta map[string]string) (fetch.Result, error) {
-	if s.appendFn != nil {
-		return s.appendFn(host, path, body, token, expectedVersion, meta)
-	}
-	return fetch.Result{}, nil
-}
-func (s *stubClient) Lookup(host, scope, query, token string, opts fetch.LookupOptions) (fetch.Result, error) {
-	if s.lookupFn != nil {
-		return s.lookupFn(host, scope, query, token, opts)
-	}
-	return fetch.Result{}, nil
-}
+// stubClient is the shared scriptable client; see client/fetchtest.
+type stubClient = fetchtest.Client
 
 func TestHandlerMarkPublish_Metadata(t *testing.T) {
 	var gotMeta map[string]string
 	sc := &stubClient{
-		publishFn: func(_, _, _, _ string, _ int, meta map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, meta map[string]string) (fetch.Result, error) {
 			gotMeta = meta
 			return fetch.Result{Response: protocol.Response{
 				Status:   "created",
@@ -608,7 +463,7 @@ func TestHandlerMarkPublish_Metadata(t *testing.T) {
 			}}, nil
 		},
 	}
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 
 	res, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
@@ -639,19 +494,13 @@ func TestHandlerMarkLookup(t *testing.T) {
 	var gotScope, gotQuery string
 	var gotOpts fetch.LookupOptions
 	sc := &stubClient{
-		lookupFn: func(_, scope, query, _ string, opts fetch.LookupOptions) (fetch.Result, error) {
+		LookupFn: func(_, scope, query, _ string, opts fetch.LookupOptions) (fetch.Result, error) {
 			gotScope, gotQuery, gotOpts = scope, query, opts
-			return fetch.Result{
-				Response: protocol.Response{
-					Status:   protocol.StatusOK,
-					Metadata: map[string]string{"matches": "1"},
-					Body:     "| Path | Importance | Title | Tags |\n",
-				},
-			}, nil
+			return fetchtest.Golden(t, "lookup"), nil
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 	result, err := h.markLookup(context.Background(), newCallToolRequest(map[string]any{
 		"url":    "mark://example.com/docs/",
 		"query":  "auth middleware",
@@ -677,19 +526,20 @@ func TestHandlerMarkLookup(t *testing.T) {
 
 func TestHandlerMarkLookup_BodyMatch(t *testing.T) {
 	answer := func(echo bool) *stubClient {
-		return &stubClient{lookupFn: func(_, _, _, _ string, opts fetch.LookupOptions) (fetch.Result, error) {
+		return &stubClient{LookupFn: func(_, _, _, _ string, opts fetch.LookupOptions) (fetch.Result, error) {
 			if opts.Match != fetch.MatchBody {
 				return fetch.Result{}, fmt.Errorf("match = %q, want body", opts.Match)
 			}
-			meta := map[string]string{"matches": "0"}
+			// A server without body match answers from the catalog and echoes nothing.
+			match := ""
 			if echo {
-				meta["match"] = "body"
+				match = protocol.MatchBody
 			}
-			return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Metadata: meta, Body: "| Path | Importance | Title | Tags | Snippet |\n"}}, nil
+			return fetchtest.Lookup("hairpin", "/", match), nil
 		}}
 	}
 	call := func(sc *stubClient) string {
-		h := &handler{client: sc, token: "test-token"}
+		h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 		result, err := h.markLookup(context.Background(), newCallToolRequest(map[string]any{
 			"url": "mark://example.com/", "query": "hairpin", "match": "body",
 		}))
@@ -709,7 +559,7 @@ func TestHandlerMarkLookup_BodyMatch(t *testing.T) {
 }
 
 func TestHandlerMarkLookup_RequiresQuery(t *testing.T) {
-	h := &handler{client: &stubClient{}, token: "test-token"}
+	h := &handler{client: &stubClient{}, defaultHost: "mark://example.com", token: "test-token"}
 	result, err := h.markLookup(context.Background(), newCallToolRequest(map[string]any{
 		"url": "mark://example.com/",
 	}))
@@ -722,15 +572,10 @@ func TestHandlerMarkLookup_RequiresQuery(t *testing.T) {
 func TestHandlerMarkAppend_AutoResolveVersion(t *testing.T) {
 	var capturedVersion int
 	sc := &stubClient{
-		versionsFn: func(_, _, _ string) (fetch.Result, error) {
-			return fetch.Result{
-				Response: protocol.Response{
-					Status:   protocol.StatusOK,
-					Metadata: map[string]string{"current": "7", "total": "7"},
-				},
-			}, nil
+		VersionsFn: func(_, _, _ string) (fetch.Result, error) {
+			return fetchtest.Versions("/doc.md", 7), nil
 		},
-		appendFn: func(_, _, _, _ string, expectedVersion int, _ map[string]string) (fetch.Result, error) {
+		AppendFn: func(_, _, _, _ string, expectedVersion int, _ map[string]string) (fetch.Result, error) {
 			capturedVersion = expectedVersion
 			return fetch.Result{
 				Response: protocol.Response{
@@ -741,7 +586,7 @@ func TestHandlerMarkAppend_AutoResolveVersion(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 	ctx := context.Background()
 
 	result, err := h.markAppend(ctx, newCallToolRequest(map[string]any{
@@ -761,7 +606,7 @@ func TestHandlerMarkAppend_AutoResolveVersion(t *testing.T) {
 
 func TestHandlerMarkAppend_AutoResolveVersionNotFound(t *testing.T) {
 	sc := &stubClient{
-		versionsFn: func(_, _, _ string) (fetch.Result, error) {
+		VersionsFn: func(_, _, _ string) (fetch.Result, error) {
 			return fetch.Result{
 				Response: protocol.Response{
 					Status:   "not-found",
@@ -771,7 +616,7 @@ func TestHandlerMarkAppend_AutoResolveVersionNotFound(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 	ctx := context.Background()
 
 	result, err := h.markAppend(ctx, newCallToolRequest(map[string]any{
@@ -787,7 +632,7 @@ func TestHandlerMarkAppend_AutoResolveVersionNotFound(t *testing.T) {
 func TestHandlerMarkAppend_ExplicitVersion(t *testing.T) {
 	var capturedVersion int
 	sc := &stubClient{
-		appendFn: func(_, _, _, _ string, expectedVersion int, _ map[string]string) (fetch.Result, error) {
+		AppendFn: func(_, _, _, _ string, expectedVersion int, _ map[string]string) (fetch.Result, error) {
 			capturedVersion = expectedVersion
 			return fetch.Result{
 				Response: protocol.Response{
@@ -798,7 +643,7 @@ func TestHandlerMarkAppend_ExplicitVersion(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 	ctx := context.Background()
 
 	result, err := h.markAppend(ctx, newCallToolRequest(map[string]any{
@@ -818,7 +663,7 @@ func TestHandlerMarkAppend_ExplicitVersion(t *testing.T) {
 }
 
 func TestHandlerMarkAppend_NegativeVersion(t *testing.T) {
-	h := &handler{token: "test-token"}
+	h := &handler{defaultHost: "mark://example.com", token: "test-token"}
 	ctx := context.Background()
 
 	result, err := h.markAppend(ctx, newCallToolRequest(map[string]any{
@@ -839,7 +684,7 @@ func TestHandlerMarkResolve_Success(t *testing.T) {
 	indexBody := "| Hash | Server | Path |\n|------|--------|------|\n| " + hash + " | mark://docs.example.com | /guide.md |\n"
 
 	sc := &stubClient{
-		fetchFn: func(_, path, _ string) (fetch.Result, error) {
+		FetchFn: func(_, path, _ string) (fetch.Result, error) {
 			if path == "/index.md" {
 				return fetch.Result{Response: protocol.Response{
 					Status: protocol.StatusOK,
@@ -902,7 +747,7 @@ func TestHandlerMarkResolve_SharedManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	shardFetches := 0
-	h := &handler{client: &stubClient{fetchFn: func(_, path, _ string) (fetch.Result, error) {
+	h := &handler{client: &stubClient{FetchFn: func(_, path, _ string) (fetch.Result, error) {
 		if path == "/index.md" {
 			return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: manifest}}, nil
 		}
@@ -936,7 +781,7 @@ func TestHandlerMarkResolve_Fallback(t *testing.T) {
 		"| " + hash + " | mark://server2.com | /b.md |\n"
 
 	sc := &stubClient{
-		fetchFn: func(host, path, _ string) (fetch.Result, error) {
+		FetchFn: func(host, path, _ string) (fetch.Result, error) {
 			if strings.Contains(path, "index") {
 				return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: indexBody}}, nil
 			}
@@ -974,7 +819,7 @@ func TestHandlerMarkResolve_NotFound(t *testing.T) {
 	indexBody := "| Hash | Server | Path |\n|------|--------|------|\n| " + hash + " | mark://server.com | /a.md |\n"
 
 	sc := &stubClient{
-		fetchFn: func(_, path, _ string) (fetch.Result, error) {
+		FetchFn: func(_, path, _ string) (fetch.Result, error) {
 			if strings.Contains(path, "index") {
 				return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: indexBody}}, nil
 			}
@@ -1013,7 +858,7 @@ func TestHandlerMarkIndex_Success(t *testing.T) {
 	var publishedPaths []string
 
 	sc := &stubClient{
-		fetchFn: func(host, path, _ string) (fetch.Result, error) {
+		FetchFn: func(host, path, _ string) (fetch.Result, error) {
 			if path == protocol.WellKnownManifestPath {
 				return fetch.Result{Response: protocol.Response{
 					Status: protocol.StatusOK,
@@ -1029,16 +874,13 @@ func TestHandlerMarkIndex_Success(t *testing.T) {
 				Body:     "# Doc",
 			}}, nil
 		},
-		listFn: func(_, path, _ string) (fetch.Result, error) {
+		ListFn: func(_, path, _ string) (fetch.Result, error) {
 			if path == "/" {
-				return fetch.Result{Response: protocol.Response{
-					Status: protocol.StatusOK,
-					Body:   "# Index of /\n\n- [doc.md](doc.md)\n",
-				}}, nil
+				return fetchtest.ListPage("/", "", "doc.md"), nil
 			}
 			return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
 		},
-		publishFn: func(_, path, body, _ string, expectedVersion int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, path, body, _ string, expectedVersion int, _ map[string]string) (fetch.Result, error) {
 			publishedBodies = append(publishedBodies, body)
 			publishedPaths = append(publishedPaths, path)
 			if expectedVersion != 0 {
@@ -1051,7 +893,7 @@ func TestHandlerMarkIndex_Success(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://hub.com", token: "test-token"}
 	result, err := h.markIndex(context.Background(), newCallToolRequest(map[string]any{
 		"source":           "mark://source.com",
 		"target":           "mark://hub.com/indexes/source.md",
@@ -1078,7 +920,7 @@ func TestHandlerMarkIndex_Success(t *testing.T) {
 func TestHandlerMarkIndex_DryRun(t *testing.T) {
 	hash := "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	sc := &stubClient{
-		fetchFn: func(_, path, _ string) (fetch.Result, error) {
+		FetchFn: func(_, path, _ string) (fetch.Result, error) {
 			if path == protocol.WellKnownManifestPath {
 				return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: "# Manifest"}}, nil
 			}
@@ -1088,16 +930,13 @@ func TestHandlerMarkIndex_DryRun(t *testing.T) {
 				Body:     "content",
 			}}, nil
 		},
-		listFn: func(_, path, _ string) (fetch.Result, error) {
+		ListFn: func(_, path, _ string) (fetch.Result, error) {
 			if path == "/" {
-				return fetch.Result{Response: protocol.Response{
-					Status: protocol.StatusOK,
-					Body:   "- [a.md](a.md)\n",
-				}}, nil
+				return fetchtest.ListPage("/", "", "a.md"), nil
 			}
 			return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			t.Fatal("publish should not be called in dry_run mode")
 			return fetch.Result{}, nil
 		},
@@ -1126,7 +965,7 @@ func TestHandlerMarkIndex_DryRun(t *testing.T) {
 
 func TestHandlerMarkIndex_BlocksWithoutManifest(t *testing.T) {
 	sc := &stubClient{
-		fetchFn: func(host, path, _ string) (fetch.Result, error) {
+		FetchFn: func(host, path, _ string) (fetch.Result, error) {
 			if path == protocol.WellKnownManifestPath {
 				return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
 			}
@@ -1135,12 +974,12 @@ func TestHandlerMarkIndex_BlocksWithoutManifest(t *testing.T) {
 			}
 			return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK}}, nil
 		},
-		listFn: func(_, _, _ string) (fetch.Result, error) {
-			return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: "- [a.md](a.md)\n"}}, nil
+		ListFn: func(_, _, _ string) (fetch.Result, error) {
+			return fetchtest.ListPage("/", "", "a.md"), nil
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test-token"}
 	result, err := h.markIndex(context.Background(), newCallToolRequest(map[string]any{
 		"source":           "mark://source.com",
 		"target":           "mark://hub.com/indexes/source.md",
@@ -1154,7 +993,7 @@ func TestHandlerMarkIndex_BlocksWithoutManifest(t *testing.T) {
 
 func TestHandlerMarkIndex_ForceOverridesManifest(t *testing.T) {
 	sc := &stubClient{
-		fetchFn: func(host, path, _ string) (fetch.Result, error) {
+		FetchFn: func(host, path, _ string) (fetch.Result, error) {
 			if path == protocol.WellKnownManifestPath {
 				return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
 			}
@@ -1167,13 +1006,13 @@ func TestHandlerMarkIndex_ForceOverridesManifest(t *testing.T) {
 				Body:     "content",
 			}}, nil
 		},
-		listFn: func(_, path, _ string) (fetch.Result, error) {
+		ListFn: func(_, path, _ string) (fetch.Result, error) {
 			if path == "/" {
-				return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: "- [a.md](a.md)\n"}}, nil
+				return fetchtest.ListPage("/", "", "a.md"), nil
 			}
 			return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{
 				Status:   "created",
 				Metadata: map[string]string{"version": "1"},
@@ -1181,7 +1020,7 @@ func TestHandlerMarkIndex_ForceOverridesManifest(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://hub.com", token: "test-token"}
 	result, err := h.markIndex(context.Background(), newCallToolRequest(map[string]any{
 		"source":           "mark://source.com",
 		"target":           "mark://hub.com/indexes/source.md",
@@ -1203,7 +1042,7 @@ func TestHandlerMarkIndex_ForceOverridesManifest(t *testing.T) {
 func TestHandlerMarkIndex_SourceNoManifestWarns(t *testing.T) {
 	hash := "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	sc := &stubClient{
-		fetchFn: func(host, path, _ string) (fetch.Result, error) {
+		FetchFn: func(host, path, _ string) (fetch.Result, error) {
 			if path == protocol.WellKnownManifestPath {
 				if host == "source.com:6309" {
 					return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
@@ -1220,18 +1059,18 @@ func TestHandlerMarkIndex_SourceNoManifestWarns(t *testing.T) {
 				Body:     "content",
 			}}, nil
 		},
-		listFn: func(_, path, _ string) (fetch.Result, error) {
+		ListFn: func(_, path, _ string) (fetch.Result, error) {
 			if path == "/" {
-				return fetch.Result{Response: protocol.Response{Status: protocol.StatusOK, Body: "- [a.md](a.md)\n"}}, nil
+				return fetchtest.ListPage("/", "", "a.md"), nil
 			}
 			return fetch.Result{Response: protocol.Response{Status: "not-found"}}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{Status: "created", Metadata: map[string]string{"version": "1"}}}, nil
 		},
 	}
 
-	h := &handler{client: sc, token: "test-token"}
+	h := &handler{client: sc, defaultHost: "mark://hub.com", token: "test-token"}
 	result, err := h.markIndex(context.Background(), newCallToolRequest(map[string]any{
 		"source":           "mark://source.com",
 		"target":           "mark://hub.com/indexes/source.md",
@@ -1479,7 +1318,7 @@ func TestHandlerMarkGraphPublish(t *testing.T) {
 
 	var publishedBody string
 	sc := &stubClient{
-		publishFn: func(_, _, body, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, body, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			publishedBody = body
 			return fetch.Result{Response: protocol.Response{
 				Status:   "created",
@@ -1488,7 +1327,7 @@ func TestHandlerMarkGraphPublish(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, graphStore: gs, token: "test-token"}
+	h := &handler{client: sc, graphStore: gs, defaultHost: "mark://target.com", token: "test-token"}
 	ctx := context.Background()
 
 	result, err := h.markGraphPublish(ctx, newCallToolRequest(map[string]any{
@@ -1558,7 +1397,7 @@ func TestHandlerMarkGraphPublish_NegativeVersion(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	h := &handler{graphStore: gs, token: "test-token"}
+	h := &handler{graphStore: gs, defaultHost: "mark://target.com", token: "test-token"}
 	ctx := context.Background()
 
 	result, err := h.markGraphPublish(ctx, newCallToolRequest(map[string]any{
@@ -1577,7 +1416,7 @@ func TestHandlerMarkPublish_OnConflictMergeDisjoint(t *testing.T) {
 	// it does NOT auto-publish — the agent verifies semantically and republishes.
 	var publishCalls int
 	sc := &stubClient{
-		fetchFn: func(_, path, _ string) (fetch.Result, error) {
+		FetchFn: func(_, path, _ string) (fetch.Result, error) {
 			switch path {
 			case "/doc.md/v5":
 				return fetch.Result{Response: protocol.Response{
@@ -1594,7 +1433,7 @@ func TestHandlerMarkPublish_OnConflictMergeDisjoint(t *testing.T) {
 			}
 			return fetch.Result{}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			publishCalls++
 			return fetch.Result{Response: protocol.Response{
 				Status:   protocol.StatusConflict,
@@ -1603,7 +1442,7 @@ func TestHandlerMarkPublish_OnConflictMergeDisjoint(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "a\nB\nc\n",
@@ -1638,7 +1477,7 @@ func TestHandlerMarkPublish_OnConflictMergeOverlap(t *testing.T) {
 	// Agent edited base v5 ("a\nb\nc\n") into "a\nB\nc\n".
 	// Latest is v6 ("a\nXX\nc\n"). diff3 produces conflict markers.
 	sc := &stubClient{
-		fetchFn: func(_, path, _ string) (fetch.Result, error) {
+		FetchFn: func(_, path, _ string) (fetch.Result, error) {
 			switch path {
 			case "/doc.md/v5":
 				return fetch.Result{Response: protocol.Response{
@@ -1655,7 +1494,7 @@ func TestHandlerMarkPublish_OnConflictMergeOverlap(t *testing.T) {
 			}
 			return fetch.Result{}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{
 				Status:   protocol.StatusConflict,
 				Metadata: map[string]string{"server-version": "6"},
@@ -1663,7 +1502,7 @@ func TestHandlerMarkPublish_OnConflictMergeOverlap(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "a\nB\nc\n",
@@ -1695,7 +1534,7 @@ func TestHandlerMarkPublish_OnConflictMergeOverlap(t *testing.T) {
 }
 
 func TestHandlerMarkPublish_OnConflictInvalid(t *testing.T) {
-	h := &handler{client: &stubClient{}, token: "test"}
+	h := &handler{client: &stubClient{}, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "x",
@@ -1723,7 +1562,7 @@ func TestHandlerMarkPublish_NegativeExpectedVersionRejected(t *testing.T) {
 			if onConflict != "" {
 				args["on_conflict"] = onConflict
 			}
-			h := &handler{client: &stubClient{}, token: "test"}
+			h := &handler{client: &stubClient{}, defaultHost: "mark://example.com", token: "test"}
 			result, err := h.markPublish(context.Background(), newCallToolRequest(args))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -1740,7 +1579,7 @@ func TestHandlerMarkPublish_BlankOnConflictUsesDefault(t *testing.T) {
 	for _, blank := range []string{"", " ", "\t"} {
 		t.Run(fmt.Sprintf("on_conflict=%q", blank), func(t *testing.T) {
 			sc := &stubClient{
-				publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+				PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 					// Return ok so we don't need fetch fixtures — we just
 					// want to verify the request was routed to the merge
 					// branch (which short-circuits to OutcomeOK on success)
@@ -1751,7 +1590,7 @@ func TestHandlerMarkPublish_BlankOnConflictUsesDefault(t *testing.T) {
 					}}, nil
 				},
 			}
-			h := &handler{client: sc, token: "test"}
+			h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 			result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 				"url":              "mark://example.com/doc.md",
 				"body":             "x",
@@ -1773,7 +1612,7 @@ func TestHandlerMarkPublish_DefaultIsMerge(t *testing.T) {
 	// returns a structurally-merged candidate, not a flat conflict response.
 	// This is the default-flip in v0.12.26 — protective behavior by default.
 	sc := &stubClient{
-		fetchFn: func(_, path, _ string) (fetch.Result, error) {
+		FetchFn: func(_, path, _ string) (fetch.Result, error) {
 			switch path {
 			case "/doc.md/v5":
 				return fetch.Result{Response: protocol.Response{
@@ -1790,7 +1629,7 @@ func TestHandlerMarkPublish_DefaultIsMerge(t *testing.T) {
 			}
 			return fetch.Result{}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{
 				Status:   protocol.StatusConflict,
 				Metadata: map[string]string{"server-version": "6"},
@@ -1798,7 +1637,7 @@ func TestHandlerMarkPublish_DefaultIsMerge(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "a\nB\nc\n",
@@ -1822,11 +1661,11 @@ func TestHandlerMarkPublish_OnConflictFail_OptOut(t *testing.T) {
 	// semantics — a server conflict reaches the agent verbatim, no diff3.
 	var fetchCalls int
 	sc := &stubClient{
-		fetchFn: func(_, _, _ string) (fetch.Result, error) {
+		FetchFn: func(_, _, _ string) (fetch.Result, error) {
 			fetchCalls++
 			return fetch.Result{}, nil
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{
 				Status:   protocol.StatusConflict,
 				Metadata: map[string]string{"server-version": "6", "your-version": "5"},
@@ -1834,7 +1673,7 @@ func TestHandlerMarkPublish_OnConflictFail_OptOut(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "x",
@@ -1863,10 +1702,10 @@ func TestHandlerMarkPublish_OnConflictMergeFirstTrySuccess(t *testing.T) {
 	// When the initial publish succeeds, the merge path returns a plain
 	// success — no candidate, no markers, no diff3 invoked.
 	sc := &stubClient{
-		published: map[string]fetch.Result{
+		Published: map[string]fetch.Result{
 			"example.com:6309/doc.md": {Response: protocol.Response{Status: protocol.StatusOK, Metadata: map[string]string{"version": "5"}}},
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{
 				Status:   protocol.StatusCreated,
 				Metadata: map[string]string{"version": "6", "modified": "2026-05-05T00:00:00Z"},
@@ -1874,7 +1713,7 @@ func TestHandlerMarkPublish_OnConflictMergeFirstTrySuccess(t *testing.T) {
 		},
 	}
 
-	h := &handler{client: sc, token: "test"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "x",
@@ -1901,10 +1740,10 @@ func TestHandlerMarkPublish_OnConflictMergeFirstTrySuccess_PreservesAllMetadata(
 	// metadata key the server returned should reach the agent, just like a
 	// plain mark_publish would.
 	sc := &stubClient{
-		published: map[string]fetch.Result{
+		Published: map[string]fetch.Result{
 			"example.com:6309/doc.md": {Response: protocol.Response{Status: protocol.StatusOK, Metadata: map[string]string{"version": "5"}}},
 		},
-		publishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
+		PublishFn: func(_, _, _, _ string, _ int, _ map[string]string) (fetch.Result, error) {
 			return fetch.Result{Response: protocol.Response{
 				Status: protocol.StatusCreated,
 				Metadata: map[string]string{
@@ -1918,7 +1757,7 @@ func TestHandlerMarkPublish_OnConflictMergeFirstTrySuccess_PreservesAllMetadata(
 		},
 	}
 
-	h := &handler{client: sc, token: "test"}
+	h := &handler{client: sc, defaultHost: "mark://example.com", token: "test"}
 	result, err := h.markPublish(context.Background(), newCallToolRequest(map[string]any{
 		"url":              "mark://example.com/doc.md",
 		"body":             "x",
@@ -1972,7 +1811,7 @@ func TestHandlerMarkGraphPublish_Retention(t *testing.T) {
 			t.Fatalf("Load: %v", err)
 		}
 		sc := &stubClient{
-			publishFn: func(_, _, _, _ string, _ int, meta map[string]string) (fetch.Result, error) {
+			PublishFn: func(_, _, _, _ string, _ int, meta map[string]string) (fetch.Result, error) {
 				*capture = meta
 				return fetch.Result{Response: protocol.Response{
 					Status:   "created",
@@ -1980,7 +1819,7 @@ func TestHandlerMarkGraphPublish_Retention(t *testing.T) {
 				}}, nil
 			},
 		}
-		return &handler{client: sc, graphStore: gs, token: "test-token"}
+		return &handler{client: sc, graphStore: gs, defaultHost: "mark://target.com", token: "test-token"}
 	}
 
 	tests := []struct {
@@ -2034,4 +1873,29 @@ func TestHandlerMarkGraphPublish_Retention(t *testing.T) {
 		}
 		assertIsToolError(t, result, "retention must be >= 0")
 	})
+}
+
+func TestResolveToken_ScopedToDefaultHost(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DEMARKUS_AUTH", "env-token")
+	tests := []struct {
+		name        string
+		defaultHost string
+		flagToken   string
+		host        string
+		want        string
+	}{
+		{"flag on default host", "mark://example.com", "flag-token", "example.com:6309", "flag-token"},
+		{"env on default host", "mark://example.com", "", "example.com:6309", "env-token"},
+		{"foreign host gets nothing", "mark://example.com", "flag-token", "evil.example:6309", ""},
+		{"no default host scopes to no host", "", "flag-token", "example.com:6309", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &handler{defaultHost: tt.defaultHost, token: tt.flagToken}
+			if got := h.resolveToken(tt.host); got != tt.want {
+				t.Errorf("resolveToken(%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
 }

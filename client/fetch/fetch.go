@@ -105,6 +105,10 @@ type Client struct {
 	quicConf *quic.Config
 	mu       sync.Mutex
 	conns    map[string]*quic.Conn
+	// inflight counts requests per connection; draining holds evicted
+	// connections until their last request releases them.
+	inflight map[*quic.Conn]int
+	draining map[*quic.Conn]bool
 }
 
 // NewClient creates a new client with the given options.
@@ -124,6 +128,8 @@ func NewClient(opts Options) *Client {
 		},
 		quicConf: qc,
 		conns:    make(map[string]*quic.Conn),
+		inflight: make(map[*quic.Conn]int),
+		draining: make(map[*quic.Conn]bool),
 	}
 }
 
@@ -132,9 +138,18 @@ func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for host, conn := range c.conns {
-		_ = conn.CloseWithError(0, "")
+		closeConn(conn)
 		delete(c.conns, host)
 	}
+	for conn := range c.draining {
+		closeConn(conn)
+		delete(c.draining, conn)
+	}
+}
+
+// closeConn closes best effort: the peer may already be gone, and no caller can act on it.
+func closeConn(conn *quic.Conn) {
+	_ = conn.CloseWithError(0, "")
 }
 
 // Fetch retrieves a document from a Mark Protocol server.
@@ -290,7 +305,7 @@ func (c *Client) PublishContext(ctx context.Context, host, path, body, token str
 	if expectedVersion >= 0 {
 		req.Metadata["expected-version"] = strconv.Itoa(expectedVersion)
 	}
-	return c.doWithRetryContext(ctx, host, func(conn *quic.Conn) (Result, error) {
+	return c.doWriteContext(ctx, host, func(conn *quic.Conn) (Result, error) {
 		return c.requestOnConnContext(ctx, conn, req)
 	})
 }
@@ -311,7 +326,7 @@ func (c *Client) Append(host, path, body, token string, expectedVersion int, met
 		req.Metadata["auth"] = token
 	}
 	req.Metadata["expected-version"] = strconv.Itoa(expectedVersion)
-	return c.doWithRetry(host, func(conn *quic.Conn) (Result, error) {
+	return c.doWriteContext(context.Background(), host, func(conn *quic.Conn) (Result, error) {
 		return c.requestOnConn(conn, req)
 	})
 }
@@ -383,7 +398,7 @@ func (c *Client) Archive(host, path, token string) (Result, error) {
 	if token != "" {
 		req.Metadata["auth"] = token
 	}
-	return c.doWithRetry(host, func(conn *quic.Conn) (Result, error) {
+	return c.doWriteContext(context.Background(), host, func(conn *quic.Conn) (Result, error) {
 		return c.requestOnConn(conn, req)
 	})
 }
@@ -406,7 +421,11 @@ func (c *Client) cachedRequestMetaContext(ctx context.Context, host, path, token
 
 		var cached *cache.Entry
 		if useCache {
-			cached, _ = c.opts.Cache.Get(host, path, verb)
+			// An unreadable cache entry is a miss: the request goes out unconditional.
+			var cacheErr error
+			if cached, cacheErr = c.opts.Cache.Get(host, path, verb); cacheErr != nil {
+				log.Printf("[WARN] cache read %s %s%s: %v", verb, host, path, cacheErr)
+			}
 			if cached != nil {
 				if etag := cached.Response.Metadata["etag"]; etag != "" {
 					req.Metadata["if-none-match"] = etag
@@ -455,40 +474,64 @@ func (c *Client) requestOnConnContext(ctx context.Context, conn *quic.Conn, req 
 	})
 	defer stopCancel()
 
-	if _, err := req.WriteTo(stream); err != nil {
+	// From the first written byte on, the server may have acted on the request.
+	if n, err := req.WriteTo(stream); err != nil {
 		stream.CancelWrite(0)
 		stream.CancelRead(0)
 		if ctx.Err() != nil {
-			return Result{}, ctx.Err()
+			err = ctx.Err()
+		} else {
+			err = fmt.Errorf("send request: %w", err)
 		}
-		return Result{}, fmt.Errorf("send request: %w", err)
+		// The request goes out in one write; zero accepted bytes means nothing was sent.
+		if n == 0 {
+			return Result{}, err
+		}
+		return Result{}, &sentError{cause: err}
 	}
 	if err := stream.Close(); err != nil {
 		stream.CancelRead(0)
 		if ctx.Err() != nil {
-			return Result{}, ctx.Err()
+			return Result{}, &sentError{cause: ctx.Err()}
 		}
-		return Result{}, fmt.Errorf("close request stream: %w", err)
+		return Result{}, &sentError{cause: fmt.Errorf("close request stream: %w", err)}
 	}
 
 	resp, err := protocol.ParseResponse(responseReader(ctx, stream))
 	if err != nil {
 		stream.CancelRead(0)
 		if ctx.Err() != nil {
-			return Result{}, ctx.Err()
+			return Result{}, &sentError{cause: ctx.Err()}
 		}
-		return Result{}, fmt.Errorf("read response: %w", err)
+		return Result{}, &sentError{cause: fmt.Errorf("read response: %w", err)}
 	}
 
 	return Result{Response: resp}, nil
 }
 
-// doWithRetry retries transient failures up to 5 times with a fixed 100ms delay.
-func (c *Client) doWithRetry(host string, fn func(conn *quic.Conn) (Result, error)) (Result, error) {
-	return c.doWithRetryContext(context.Background(), host, fn)
+// ErrOutcomeUnknown marks a write that failed after its request was sent: it
+// may or may not have landed. Callers reconcile against the head, never resend.
+var ErrOutcomeUnknown = errors.New("request sent but outcome unknown")
+
+// sentError wraps a failure that happened after request bytes left the client.
+type sentError struct{ cause error }
+
+func (e *sentError) Error() string   { return e.cause.Error() }
+func (e *sentError) Unwrap() error   { return e.cause }
+func (e *sentError) Is(t error) bool { return t == ErrOutcomeUnknown }
+
+// doWriteContext is doWithRetryContext for non idempotent verbs: dial and
+// open stream failures retry, anything after the request was sent does not.
+func (c *Client) doWriteContext(ctx context.Context, host string, fn func(conn *quic.Conn) (Result, error)) (Result, error) {
+	return c.retry(ctx, host, false, fn)
 }
 
+// doWithRetryContext retries transient failures up to 5 times with a fixed 100ms delay.
 func (c *Client) doWithRetryContext(ctx context.Context, host string, fn func(conn *quic.Conn) (Result, error)) (Result, error) {
+	return c.retry(ctx, host, true, fn)
+}
+
+func (c *Client) retry(ctx context.Context, host string, resend bool, fn func(conn *quic.Conn) (Result, error)) (Result, error) {
 	const maxRetries = 5
 	const retryDelay = 100 * time.Millisecond
 
@@ -497,21 +540,31 @@ func (c *Client) doWithRetryContext(ctx context.Context, host string, fn func(co
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
 		}
-		conn, err := c.getConnContext(ctx, host)
+		// A failed dial stored nothing; whatever is pooled belongs to someone else.
+		conn, err := c.acquire(ctx, host)
 		if err != nil {
 			if attempt < maxRetries-1 && isTransientError(err) {
 				if err := waitForRetry(ctx, retryDelay); err != nil {
 					return Result{}, err
 				}
-				c.removeConn(host)
 				continue
 			}
 			return Result{}, err
 		}
 
 		result, err := fn(conn)
+		unknown := !resend && errors.Is(err, ErrOutcomeUnknown)
+		if err != nil && (unknown || isTransientError(err)) {
+			c.evict(host, conn)
+		}
+		c.release(conn)
 		if err == nil {
 			return result, nil
+		}
+		// Checked before caller cancellation, which would otherwise read as a
+		// definite failure and invite a resend of a write that may have landed.
+		if unknown {
+			return Result{}, err
 		}
 		if ctx.Err() != nil {
 			return Result{}, ctx.Err()
@@ -522,7 +575,6 @@ func (c *Client) doWithRetryContext(ctx context.Context, host string, fn func(co
 			if err := waitForRetry(ctx, retryDelay); err != nil {
 				return Result{}, err
 			}
-			c.removeConn(host)
 			continue
 		}
 
@@ -547,11 +599,10 @@ func (c *Client) getConnContext(ctx context.Context, host string) (*quic.Conn, e
 	c.mu.Unlock()
 
 	if ok {
-		if conn.Context().Err() != nil {
-			c.removeConn(host)
-		} else {
+		if conn.Context().Err() == nil {
 			return conn, nil
 		}
+		c.evict(host, conn)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, c.opts.DialTimeout)
@@ -584,7 +635,7 @@ func (c *Client) getConnContext(ctx context.Context, host string) (*quic.Conn, e
 		// Another goroutine dialed and stored a connection while we were dialing.
 		// Use theirs; close ours.
 		c.mu.Unlock()
-		_ = conn.CloseWithError(0, "")
+		closeConn(conn)
 		return existing, nil
 	}
 	c.conns[host] = conn
@@ -600,10 +651,62 @@ func authorityHostname(authority string) string {
 	return authority
 }
 
-func (c *Client) removeConn(host string) {
+// acquire returns the pooled connection for host, dialing if needed, and counts
+// the caller as a user until release.
+func (c *Client) acquire(ctx context.Context, host string) (*quic.Conn, error) {
+	for {
+		conn, err := c.getConnContext(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		// Still pooled and not retiring: an idle evict closes without marking draining.
+		if c.conns[host] == conn && !c.draining[conn] {
+			c.inflight[conn]++
+			c.mu.Unlock()
+			return conn, nil
+		}
+		// Evicted between lookup and here; look again.
+		c.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// release ends one use of conn and closes it if it was evicted and is now idle.
+func (c *Client) release(conn *quic.Conn) {
 	c.mu.Lock()
-	delete(c.conns, host)
+	c.inflight[conn]--
+	idle := c.inflight[conn] <= 0
+	if idle {
+		delete(c.inflight, conn)
+	}
+	closing := idle && c.draining[conn]
+	if closing {
+		delete(c.draining, conn)
+	}
 	c.mu.Unlock()
+	if closing {
+		closeConn(conn)
+	}
+}
+
+// evict retires conn: no new users, closed after its last release. The pool
+// entry goes only if it still is conn, so a replacement is never dropped.
+func (c *Client) evict(host string, conn *quic.Conn) {
+	c.mu.Lock()
+	if c.conns[host] == conn {
+		delete(c.conns, host)
+	}
+	idle := c.inflight[conn] <= 0
+	if !idle {
+		c.draining[conn] = true
+	}
+	c.mu.Unlock()
+	if idle {
+		closeConn(conn)
+	}
 }
 
 func isTransientError(err error) bool {

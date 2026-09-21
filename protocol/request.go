@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -30,27 +31,8 @@ const MaxRequestFrontmatterLength = 65536 // 64KB
 // MaxBodyLength is the maximum allowed size for a document body (1 MiB).
 const MaxBodyLength = 1 * 1024 * 1024
 
-// Frontmatter delimiters as they appear on the wire. Parser and serializer
-// share these so the two sides of the wire format cannot drift.
-const (
-	// frontmatterFence is the bare fence line that opens and closes a
-	// YAML frontmatter block on the wire.
-	frontmatterFence = "---\n"
-	// frontmatterOpen is the opening delimiter at the start of a request
-	// payload (no leading newline).
-	frontmatterOpen = frontmatterFence
-	// frontmatterClose is the closing delimiter with a body following
-	// (leading newline from prior content + fence).
-	frontmatterClose = "\n" + frontmatterFence
-	// frontmatterTrim matches a closing "---" at end-of-input, no trailing newline.
-	frontmatterTrim = "\n---"
-)
-
-// requestWireOverhead is generous slack allowed above the frontmatter and body
-// limits when reading the request payload, so we get a clean
-// "payload exceeds limit" error rather than truncating mid-read. The real
-// budgets are MaxRequestFrontmatterLength and MaxBodyLength; this covers
-// delimiter bytes plus any trailing bytes the client may send.
+// requestWireOverhead is slack above the frontmatter and body budgets, so an
+// oversized payload fails with a clean limit error instead of a truncated read.
 const requestWireOverhead = 64
 
 // ParseRequest reads a request from r.
@@ -74,10 +56,11 @@ func ParseRequest(r io.Reader) (Request, error) {
 		return req, nil
 	}
 
-	fm, body, err := splitFrontmatterAndBody(rest)
+	split, err := splitFrontmatterAndBody(rest)
 	if err != nil {
 		return Request{}, err
 	}
+	fm, body := split.Block, split.Body
 
 	if len(fm) > 0 {
 		meta, err := decodeFrontmatter(fm)
@@ -95,6 +78,10 @@ func ParseRequest(r io.Reader) (Request, error) {
 	return req, nil
 }
 
+// ErrMalformedRequest marks a request that breaks the wire grammar, as opposed
+// to a read failure or a size limit. Servers answer it with bad-request.
+var ErrMalformedRequest = errors.New("malformed request")
+
 // parseRequestLine reads and validates the request line ("VERB /path\n").
 func parseRequestLine(br *bufio.Reader) (verb, path string, err error) {
 	line, err := readLineLimited(br, MaxRequestLineLength)
@@ -104,14 +91,14 @@ func parseRequestLine(br *bufio.Reader) (verb, path string, err error) {
 
 	verb, path, ok := strings.Cut(line, " ")
 	if !ok {
-		return "", "", fmt.Errorf("malformed request: %q", line)
+		return "", "", fmt.Errorf("%w: %q", ErrMalformedRequest, line)
 	}
 
 	if verb == "" {
-		return "", "", fmt.Errorf("empty verb")
+		return "", "", fmt.Errorf("%w: empty verb", ErrMalformedRequest)
 	}
 	if !IsValidVerb(verb) {
-		return "", "", fmt.Errorf("unknown verb: %q", verb)
+		return "", "", fmt.Errorf("%w: unknown verb: %q", ErrMalformedRequest, verb)
 	}
 
 	if err := ValidateRequestPath(path); err != nil {
@@ -124,13 +111,13 @@ func parseRequestLine(br *bufio.Reader) (verb, path string, err error) {
 // ValidateRequestPath checks the path syntax shared by wire and storage layers.
 func ValidateRequestPath(path string) error {
 	if path == "" || !strings.HasPrefix(path, "/") {
-		return fmt.Errorf("invalid path: %q", path)
+		return fmt.Errorf("%w: invalid path: %q", ErrMalformedRequest, path)
 	}
 	if len(path) > MaxRequestPathLength {
-		return fmt.Errorf("invalid path: exceeds %d bytes", MaxRequestPathLength)
+		return fmt.Errorf("%w: invalid path: exceeds %d bytes", ErrMalformedRequest, MaxRequestPathLength)
 	}
 	if containsControlChars(path) {
-		return fmt.Errorf("invalid path: contains control characters")
+		return fmt.Errorf("%w: invalid path: contains control characters", ErrMalformedRequest)
 	}
 	return nil
 }
@@ -158,36 +145,17 @@ func readBounded(r io.Reader, limit int64, what string) ([]byte, error) {
 	return data, nil
 }
 
-// splitFrontmatterAndBody separates a request payload into its frontmatter and
-// body components. When no frontmatter is present the whole payload is the body.
-// The frontmatter length is checked against MaxRequestFrontmatterLength here;
-// the body length is checked by the caller against MaxBodyLength.
-func splitFrontmatterAndBody(data []byte) (fm, body []byte, err error) {
-	if !bytes.HasPrefix(data, []byte(frontmatterOpen)) {
-		return nil, data, nil
+// splitFrontmatterAndBody splits a request payload and checks the frontmatter
+// against MaxRequestFrontmatterLength; the caller checks the body length.
+func splitFrontmatterAndBody(data []byte) (Frontmatter, error) {
+	split, err := SplitFrontmatter(data)
+	if err != nil {
+		return Frontmatter{}, fmt.Errorf("%w: %w", ErrMalformedRequest, err)
 	}
-
-	inner := data[len(frontmatterOpen):]
-
-	// Closing form 1: "\n---\n" with possibly more bytes after (the body).
-	// Closing form 2: "\n---" at end of input, no body.
-	var fmEnd, bodyStart int
-	if idx := bytes.Index(inner, []byte(frontmatterClose)); idx >= 0 {
-		fmEnd = idx
-		bodyStart = idx + len(frontmatterClose)
-	} else if bytes.HasSuffix(inner, []byte(frontmatterTrim)) {
-		fmEnd = len(inner) - len(frontmatterTrim)
-		bodyStart = len(inner)
-	} else {
-		return nil, nil, fmt.Errorf("malformed request: unclosed frontmatter")
+	if len(split.Block) > MaxRequestFrontmatterLength {
+		return Frontmatter{}, fmt.Errorf("request metadata exceeds limit: %d > %d bytes", len(split.Block), MaxRequestFrontmatterLength)
 	}
-
-	fm = inner[:fmEnd]
-	if len(fm) > MaxRequestFrontmatterLength {
-		return nil, nil, fmt.Errorf("request metadata exceeds limit: %d > %d bytes", len(fm), MaxRequestFrontmatterLength)
-	}
-	body = inner[bodyStart:]
-	return fm, body, nil
+	return split, nil
 }
 
 // decodeFrontmatter parses a YAML frontmatter block into a string-to-string map.
@@ -196,7 +164,7 @@ func splitFrontmatterAndBody(data []byte) (fm, body []byte, err error) {
 func decodeFrontmatter(fm []byte) (map[string]string, error) {
 	var meta map[string]string
 	if err := yaml.Unmarshal(fm, &meta); err != nil {
-		return nil, fmt.Errorf("parsing request metadata: %w", err)
+		return nil, fmt.Errorf("%w: parsing request metadata: %w", ErrMalformedRequest, err)
 	}
 	if meta == nil {
 		meta = make(map[string]string)
@@ -239,9 +207,12 @@ func (req Request) WriteTo(w io.Writer) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("encoding request metadata: %w", err)
 		}
-		buf.WriteString(frontmatterFence)
+		buf.WriteString(FrontmatterFence)
 		buf.Write(yamlBytes)
-		buf.WriteString(frontmatterFence)
+		buf.WriteString(FrontmatterFence)
+	} else if strings.HasPrefix(req.Body, FrontmatterFence) {
+		// Empty block first, or the parser reads the body's own fence as metadata.
+		buf.WriteString(FrontmatterFence + frontmatterClose)
 	}
 
 	if req.Body != "" {

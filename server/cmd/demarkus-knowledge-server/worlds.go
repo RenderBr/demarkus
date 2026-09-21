@@ -18,6 +18,7 @@ import (
 	"github.com/latebit-io/demarkus/server/internal/knowledgeconfig"
 	"github.com/latebit-io/demarkus/server/internal/snirouter"
 	"github.com/latebit-io/demarkus/server/internal/worldruntime"
+	"github.com/latebit-io/demarkus/server/internal/writepolicy"
 )
 
 // worldAddTimeout bounds one world's open (GCS dial, genesis, head load).
@@ -53,6 +54,10 @@ type worldManager struct {
 	// needsPublish marks a failed router/token publish so the retry
 	// loop re-attempts it without waiting for another config event.
 	needsPublish bool
+	// retiring holds replaced and removed worlds until a publish succeeds.
+	retiring []retiredWorld
+	// beforeRetire is a test hook, called before a retired runtime closes.
+	beforeRetire func(name string)
 	// resilient marks dynamic deployments (worldsFile set): a failed
 	// world open degrades to pending instead of failing the process.
 	resilient bool
@@ -61,6 +66,9 @@ type worldManager struct {
 type worldEntry struct {
 	config  knowledgeconfig.WorldConfig
 	runtime *worldruntime.Runtime
+	// published is set once a router publish carried this runtime; until
+	// then nothing routes to it and it can close at once.
+	published bool
 }
 
 // newWorldManager opens the initial world set. In static mode (no
@@ -115,6 +123,12 @@ func (m *worldManager) Reload() error {
 	return m.apply(config.Worlds)
 }
 
+// retiredWorld is a runtime out of m.entries that the router may still reach.
+type retiredWorld struct {
+	name  string
+	entry *worldEntry
+}
+
 // apply diffs desired against live. In resilient mode per-world failures
 // are logged and retried; in static mode the first failure is returned.
 func (m *worldManager) apply(desired []knowledgeconfig.WorldConfig) error {
@@ -136,7 +150,14 @@ func (m *worldManager) apply(desired []knowledgeconfig.WorldConfig) error {
 		} else {
 			m.logger.Info("world removed", "world", name)
 		}
-		m.closeEntryLocked(name, entry)
+		delete(m.entries, name)
+		if !entry.published {
+			m.retireEntryLocked(name, entry)
+			continue
+		}
+		// Closed by the next publish that succeeds, so the router never
+		// points at a closed runtime.
+		m.retiring = append(m.retiring, retiredWorld{name: name, entry: entry})
 	}
 	for name := range m.pending {
 		if _, keep := want[name]; !keep {
@@ -196,19 +217,25 @@ func (m *worldManager) openLocked(world *knowledgeconfig.WorldConfig) error {
 	}
 	store, err := bucketstore.Open(ctx, objects, bucketstore.Options{
 		WorldID:        world.Bucket.WorldID,
+		Logger:         m.logger.With("world", world.Name),
 		RequestTimeout: time.Duration(world.Limits.RequestTimeout),
-		RequirePolicy:  !world.Bootstrap,
 		PolicySeed:     seed,
 		MaxDocuments:   world.Limits.MaxDocuments,
 	})
 	if err != nil {
 		return fmt.Errorf("bucket: %w", err)
 	}
+	// A provisioned world gets its policy from the broker later; every other
+	// world must hold a usable one before it serves a write.
+	requirePolicy := !world.Bootstrap
+	if requirePolicy {
+		if err := writepolicy.Validate(ctx, store); err != nil {
+			return fmt.Errorf("policy: %w", err)
+		}
+	}
 	runtime, err := worldruntime.New(&worldruntime.Config{
 		Name:              world.Name,
-		Store:             store,
-		Catalog:           store,
-		Views:             store,
+		Store:             writepolicy.Enforce(store, writepolicy.Options{Require: requirePolicy}),
 		TokensFile:        world.Auth.TokensFile,
 		DisableTokenWatch: true, // the coordinator owns reloads
 		ReadOnly:          world.ReadOnly,
@@ -320,11 +347,19 @@ func (m *worldManager) releaseTokenWatchLocked(tokensFile string) {
 }
 
 func (m *worldManager) closeEntryLocked(name string, entry *worldEntry) {
+	delete(m.entries, name)
+	m.retireEntryLocked(name, entry)
+}
+
+// retireEntryLocked closes an entry already removed from m.entries.
+func (m *worldManager) retireEntryLocked(name string, entry *worldEntry) {
+	if m.beforeRetire != nil {
+		m.beforeRetire(name)
+	}
 	m.releaseTokenWatchLocked(entry.config.Auth.TokensFile)
 	if err := entry.runtime.Close(); err != nil {
 		m.logger.Warn("world runtime close failed", "world", name, "error", err)
 	}
-	delete(m.entries, name)
 }
 
 // publishLocked rebuilds the router and token-coordinator views from
@@ -350,6 +385,14 @@ func (m *worldManager) publishLocked() error {
 	}); err != nil {
 		return fmt.Errorf("publish world views: %w", err)
 	}
+	for _, entry := range m.entries {
+		entry.published = true
+	}
+	// The router left them only now; a failed publish keeps them serving.
+	for _, retired := range m.retiring {
+		m.retireEntryLocked(retired.name, retired.entry)
+	}
+	m.retiring = nil
 	return nil
 }
 
@@ -384,6 +427,11 @@ func (m *worldManager) retryPending() {
 		recovered = true
 	}
 	if recovered {
+		if err := m.reloadStagedTokensLocked(); err != nil {
+			m.logger.Error("staged token reload failed; publish deferred", "error", err)
+			m.needsPublish = true
+			return
+		}
 		if err := m.publishLocked(); err != nil {
 			m.logger.Error("publish after world retry failed", "error", err)
 			m.needsPublish = true
@@ -391,6 +439,22 @@ func (m *worldManager) retryPending() {
 		}
 		m.needsPublish = false
 	}
+}
+
+// reloadStagedTokensLocked refreshes runtimes no publish has carried yet; the
+// coordinator reloads published worlds only. A failure blocks the publish:
+// going live with the old snapshot could serve replaced credentials.
+func (m *worldManager) reloadStagedTokensLocked() error {
+	var errs []error
+	for name, entry := range m.entries {
+		if entry.published {
+			continue
+		}
+		if err := entry.runtime.ReloadTokens(); err != nil {
+			errs = append(errs, fmt.Errorf("world %q: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Router exposes the dynamic router (selector + handshake hook source).
@@ -413,4 +477,8 @@ func (m *worldManager) Close() {
 	for name, entry := range m.entries {
 		m.closeEntryLocked(name, entry)
 	}
+	for _, retired := range m.retiring {
+		m.retireEntryLocked(retired.name, retired.entry)
+	}
+	m.retiring = nil
 }

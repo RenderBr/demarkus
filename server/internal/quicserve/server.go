@@ -22,6 +22,7 @@ var ErrServerClosed = errors.New("quicserve: server closed")
 type Stream interface {
 	io.ReadWriteCloser
 	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
 }
 
 // Endpoint handles streams for one accepted connection.
@@ -74,6 +75,9 @@ func Listen(config Config) (*Server, error) {
 	if config.TLSConfig == nil {
 		return nil, errors.New("quicserve: TLS config is nil")
 	}
+	if config.Logger == nil {
+		return nil, errors.New("quicserve: logger is nil")
+	}
 
 	listener, err := quic.ListenAddr(config.Address, config.TLSConfig, config.QUICConfig)
 	if err != nil {
@@ -83,9 +87,6 @@ func Listen(config Config) (*Server, error) {
 }
 
 func newServer(listener connectionListener, logger *slog.Logger) *Server {
-	if logger == nil {
-		logger = slog.Default()
-	}
 	acceptCtx, cancelAccept := context.WithCancel(context.Background())
 	return &Server{
 		listener:     listener,

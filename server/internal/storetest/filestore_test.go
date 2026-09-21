@@ -6,19 +6,37 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/latebit-io/demarkus/protocol/publishpolicy"
 	"github.com/latebit-io/demarkus/protocol/store"
+	"github.com/latebit-io/demarkus/protocol/storefmt"
+	"github.com/latebit-io/demarkus/server/internal/catalog"
+	"github.com/latebit-io/demarkus/server/internal/filestore"
 	"github.com/latebit-io/demarkus/server/internal/handler"
+	"github.com/latebit-io/demarkus/server/internal/writepolicy"
 )
 
-// TestFileStoreConformance runs the conformance suite against the file
-// store, pinning the reference behavior every other backend must match.
+// TestFileStoreConformance runs the suite against the filestore backend that
+// production serves; tampering reaches the raw store under it.
 func TestFileStoreConformance(t *testing.T) {
+	var mu sync.Mutex
+	documents := map[handler.DocumentStore]*store.Store{}
 	RunConformance(t, func(t *testing.T) handler.DocumentStore {
-		return store.New(t.TempDir())
-	}, FileTamper)
+		raw := store.New(t.TempDir())
+		wrapped := filestore.New(raw, catalog.New())
+		mu.Lock()
+		documents[wrapped] = raw
+		mu.Unlock()
+		return wrapped
+	}, func(t testing.TB, s handler.DocumentStore, path string, version int, stored []byte) {
+		mu.Lock()
+		raw := documents[s]
+		mu.Unlock()
+		FileTamper(t, raw, path, version, stored)
+	})
 }
 
 // TestFileStoreLookupConformance runs the LOOKUP conformance suite against
@@ -32,6 +50,11 @@ func TestFileStoreLookupConformance(t *testing.T) {
 // the match key on the file backend.
 func TestFileStoreLookupHandlerConformance(t *testing.T) {
 	RunLookupHandlerConformance(t, func(t *testing.T) LookupBackend { return FileBackend(t) })
+}
+
+// TestFileStoreHandlerConformance pins backend dependent wire behavior.
+func TestFileStoreHandlerConformance(t *testing.T) {
+	RunHandlerConformance(t, func(t *testing.T) LookupBackend { return FileBackend(t) })
 }
 
 // TestFileStoreDifferentialSelf runs the differential harness with the file
@@ -54,7 +77,7 @@ func TestFileStoreHandlerDifferentialSelf(t *testing.T) {
 func TestFileStoreMigrationRoundTrip(t *testing.T) {
 	RunMigrationRoundTrip(t, func(t *testing.T) MigrationBackend {
 		s := store.New(t.TempDir())
-		return MigrationBackend{Migrator: s, Store: s}
+		return MigrationBackend{Migrator: s, Store: filestore.New(s, catalog.New())}
 	})
 }
 
@@ -83,7 +106,7 @@ func TestFileStoreImportRefusesOrphanedVersionDir(t *testing.T) {
 		t.Fatalf("orphan: %v", err)
 	}
 
-	err = s.ImportDoc(context.Background(), "/x.md", store.StoredDocument{Versions: []store.StoredVersion{{
+	err = s.ImportDoc(context.Background(), "/x.md", storefmt.StoredDocument{Versions: []storefmt.StoredVersion{{
 		Version: 1, Stored: []byte("# other\n"), Modified: time.Now(),
 	}}})
 	if !errors.Is(err, os.ErrExist) {
@@ -96,4 +119,21 @@ func TestFileStoreImportRefusesOrphanedVersionDir(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Error("orphaned version file modified by refused import")
 	}
+}
+
+// TestFileStoreRejectionConformance: with the policy decorator above it the
+// file backend refuses exactly as the bucket backend does. It has no quota.
+func TestFileStoreRejectionConformance(t *testing.T) {
+	RunRejectionConformance(t, RejectionFactories{
+		Policy: func(t *testing.T) LookupBackend {
+			b := FileBackend(t)
+			policy := []byte("# Write Policy\n\nCurated.\n\nstrictness: block\nrequire_tags: domain\n")
+			meta := map[string]string{"tags": "category:governance", "type": "Policy"}
+			if _, err := b.direct().WriteVersion(publishpolicy.DocumentPath, 0, policy, meta); err != nil {
+				t.Fatalf("seed policy: %v", err)
+			}
+			b.Store = writepolicy.Enforce(b.Store, writepolicy.Options{Require: true})
+			return b
+		},
+	})
 }

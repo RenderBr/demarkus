@@ -8,12 +8,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/latebit-io/demarkus/protocol"
 	"github.com/latebit-io/demarkus/protocol/publishpolicy"
-	protocolstore "github.com/latebit-io/demarkus/protocol/store"
+	"github.com/latebit-io/demarkus/protocol/storefmt"
+	"github.com/latebit-io/demarkus/server/internal/backend/backendtest"
 	"github.com/latebit-io/demarkus/server/internal/certsource"
 	"github.com/latebit-io/demarkus/server/internal/knowledge/blob"
 	"github.com/latebit-io/demarkus/server/internal/knowledge/bucketstore"
@@ -175,17 +178,17 @@ func (h *worldsTestHarness) objects(t *testing.T, world string) *blob.Memory {
 	return store
 }
 
-// seededPolicy reopens the world with enforcement on and returns its policy,
+// seededPolicy reopens the world and returns its policy,
 // which only exists if the manager seeded one.
-func (h *worldsTestHarness) seededPolicy(t *testing.T, world string) *protocolstore.Document {
+func (h *worldsTestHarness) seededPolicy(t *testing.T, world string) *storefmt.Document {
 	t.Helper()
 	store, err := bucketstore.Open(context.Background(), h.objects(t, world), bucketstore.Options{
-		WorldID: testWorldID, RequirePolicy: true,
+		Logger: slog.New(slog.DiscardHandler), WorldID: testWorldID,
 	})
 	if err != nil {
 		t.Fatalf("reopen seeded world: %v", err)
 	}
-	document, err := store.Get(publishpolicy.DocumentPath, 0)
+	document, err := backendtest.Direct{Store: store}.Get(publishpolicy.DocumentPath, 0)
 	if err != nil {
 		t.Fatalf("get seeded policy: %v", err)
 	}
@@ -397,5 +400,143 @@ func TestWorldManagerStaticModeFailsFast(t *testing.T) {
 	worlds := "worlds:\n" + worldFragment("alice", testWorldID, tokens, false)
 	if _, err := openHarness(t, t.TempDir(), worlds, unreachable); err == nil {
 		t.Fatal("static mode must fail fast on an unopenable world")
+	}
+}
+
+// A retired world must leave the router before its runtime closes; otherwise
+// streams routed in between reach a closed runtime and are dropped.
+func TestWorldManagerUnroutesBeforeClosing(t *testing.T) {
+	tokensDir := t.TempDir()
+	tokensA := writeTokens(t, tokensDir, "alice")
+	tokensB := writeTokens(t, tokensDir, "bob")
+	h := newWorldsHarness(t, "worlds:\n"+
+		worldFragment("alice", testWorldID, tokensA, true)+
+		worldFragment("bob", testWorldIDB, tokensB, true))
+
+	var retired []string
+	h.manager.beforeRetire = func(name string) {
+		retired = append(retired, name)
+		if name == "alice" && h.routes("alice.memory.svc.cluster.local") {
+			t.Error("removed world still routed while its runtime closes")
+		}
+	}
+
+	// alice is removed; bob is replaced by a changed config.
+	h.writeFragment(t, "worlds:\n"+worldFragment("bob", testWorldIDB, tokensB, false))
+	if err := h.manager.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	slices.Sort(retired)
+	if !slices.Equal(retired, []string{"alice", "bob"}) {
+		t.Errorf("retired = %v, want alice and bob", retired)
+	}
+	if !h.routes("bob.memory.svc.cluster.local") {
+		t.Error("replaced world lost routing")
+	}
+}
+
+// A failed publish leaves the router on the old runtimes, so they must stay
+// open until a later publish really replaces them.
+func TestWorldManagerKeepsRetiredRuntimeUntilPublishSucceeds(t *testing.T) {
+	tokensDir := t.TempDir()
+	shared := fmt.Sprintf("[tokens.w]\nhash = %q\npaths = [\"/*\"]\noperations = [\"publish\"]\n", protocol.HashToken("same-secret"))
+	tokensA := filepath.Join(tokensDir, "alice.toml")
+	if err := os.WriteFile(tokensA, []byte(shared), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokensB := writeTokens(t, tokensDir, "bob")
+	h := newWorldsHarness(t, "worlds:\n"+
+		worldFragment("alice", testWorldID, tokensA, true)+
+		worldFragment("bob", testWorldIDB, tokensB, true))
+
+	var retired []string
+	h.manager.beforeRetire = func(name string) { retired = append(retired, name) }
+
+	// bob is replaced, and its new tokens collide with alice: the publish fails.
+	if err := os.WriteFile(tokensB, []byte(shared), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.writeFragment(t, "worlds:\n"+
+		worldFragment("alice", testWorldID, tokensA, true)+
+		worldFragment("bob", testWorldIDB, tokensB, false))
+	if err := h.manager.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(retired) != 0 {
+		t.Fatalf("retired %v although the router still points at the old runtime", retired)
+	}
+	if !h.routes("bob.memory.svc.cluster.local") {
+		t.Fatal("bob lost routing after a failed publish")
+	}
+
+	// An unreadable staged tokens file must block the publish: going live
+	// with the old snapshot would serve credentials the operator replaced.
+	if err := os.WriteFile(tokensB, []byte("not [valid toml"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.manager.retryPending()
+	h.manager.mu.Lock()
+	reloadErr := h.manager.reloadStagedTokensLocked()
+	stillNeeded, published := h.manager.needsPublish, h.manager.entries["bob"].published
+	h.manager.mu.Unlock()
+	if reloadErr == nil || !strings.Contains(reloadErr.Error(), "bob") {
+		t.Fatalf("staged reload error = %v, want one naming bob", reloadErr)
+	}
+	if !stillNeeded || published || len(retired) != 0 {
+		t.Fatalf("after a failed token reload: needsPublish=%v published=%v retired=%v", stillNeeded, published, retired)
+	}
+
+	// The collision is fixed; the retry publishes and only then retires.
+	if err := os.WriteFile(tokensB, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The coordinator reloads published worlds only; the retry must refresh
+	// the staged runtime itself or it fails the same validation forever.
+	h.manager.retryPending()
+	if !slices.Equal(retired, []string{"bob"}) {
+		t.Errorf("retired = %v, want bob after the successful publish", retired)
+	}
+}
+
+// A staged runtime the router never reached closes at once when superseded;
+// queueing it would grow m.retiring on every changed reload.
+func TestWorldManagerClosesSupersededStagedRuntime(t *testing.T) {
+	tokensDir := t.TempDir()
+	shared := fmt.Sprintf("[tokens.w]\nhash = %q\npaths = [\"/*\"]\noperations = [\"publish\"]\n", protocol.HashToken("same-secret"))
+	tokensA := filepath.Join(tokensDir, "alice.toml")
+	if err := os.WriteFile(tokensA, []byte(shared), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokensB := writeTokens(t, tokensDir, "bob")
+	h := newWorldsHarness(t, "worlds:\n"+
+		worldFragment("alice", testWorldID, tokensA, true)+
+		worldFragment("bob", testWorldIDB, tokensB, true))
+
+	var retired []string
+	h.manager.beforeRetire = func(name string) { retired = append(retired, name) }
+
+	// Two changed reloads in a row, each failing to publish on the collision.
+	if err := os.WriteFile(tokensB, []byte(shared), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, bootstrap := range []bool{false, true} {
+		h.writeFragment(t, "worlds:\n"+
+			worldFragment("alice", testWorldID, tokensA, true)+
+			worldFragment("bob", testWorldIDB, tokensB, bootstrap))
+		if err := h.manager.Reload(); err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+	}
+
+	// The first staged bob closed when the second replaced it; the published
+	// bob is the only one still waiting.
+	if !slices.Equal(retired, []string{"bob"}) {
+		t.Errorf("retired = %v, want exactly the superseded staged bob", retired)
+	}
+	h.manager.mu.Lock()
+	waiting := len(h.manager.retiring)
+	h.manager.mu.Unlock()
+	if waiting != 1 {
+		t.Errorf("retiring holds %d runtimes, want 1", waiting)
 	}
 }

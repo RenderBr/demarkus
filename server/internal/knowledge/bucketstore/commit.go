@@ -19,14 +19,14 @@ const (
 	commitRebase
 )
 
-func (store *Store) runMutation(build mutationBuilder) (MutationResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), store.requestTimeout)
+func (store *Store) runMutation(ctx context.Context, build mutationBuilder) (MutationResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, store.requestTimeout)
 	defer cancel()
 	select {
 	case <-store.commitToken:
 		defer func() { store.commitToken <- struct{}{} }()
 	case <-ctx.Done():
-		return MutationResult{}, ctx.Err()
+		return MutationResult{}, fmt.Errorf("wait for commit token: %w", ctx.Err())
 	}
 
 	operationID, err := store.newOperationID()
@@ -43,7 +43,7 @@ func (store *Store) runMutation(build mutationBuilder) (MutationResult, error) {
 		if err != nil {
 			return result, fmt.Errorf("operation %s refresh: %w", operationID, err)
 		}
-		view := &readView{ctx: ctx, cancel: func() {}, objects: store.objects, snapshot: loaded}
+		view := &readView{ctx: ctx, objects: store.objects, snapshot: loaded}
 		candidate, built, err := build(ctx, view, operationID)
 		result = built
 		if err != nil || candidate == nil {

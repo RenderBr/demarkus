@@ -4,10 +4,11 @@ import (
 	"context"
 	"testing"
 
-	protocolstore "github.com/latebit-io/demarkus/protocol/store"
+	"github.com/latebit-io/demarkus/protocol/storefmt"
 	"github.com/latebit-io/demarkus/server/internal/handler"
 	"github.com/latebit-io/demarkus/server/internal/knowledge/blob"
 	"github.com/latebit-io/demarkus/server/internal/storetest"
+	"github.com/latebit-io/demarkus/server/internal/writepolicy"
 )
 
 func TestStoreConformance(t *testing.T) {
@@ -20,15 +21,56 @@ func TestStoreConformance(t *testing.T) {
 func TestLookupConformance(t *testing.T) {
 	storetest.RunLookupConformance(t, func(t *testing.T) storetest.LookupBackend {
 		store, _ := newWritableStore(t)
-		return storetest.LookupBackend{Store: store, Catalog: store, Views: store}
+		return storetest.LookupBackend{Store: store}
 	})
 }
 
 func TestLookupHandlerConformance(t *testing.T) {
 	storetest.RunLookupHandlerConformance(t, func(t *testing.T) storetest.LookupBackend {
 		store, _ := newWritableStore(t)
-		return storetest.LookupBackend{Store: store, Catalog: store, Views: store}
+		return storetest.LookupBackend{Store: store}
 	})
+}
+
+func TestHandlerConformance(t *testing.T) {
+	storetest.RunHandlerConformance(t, func(t *testing.T) storetest.LookupBackend {
+		store, _ := newWritableStore(t)
+		return storetest.LookupBackend{Store: store}
+	})
+}
+
+func TestRejectionConformance(t *testing.T) {
+	open := func(t *testing.T, options Options) storetest.LookupBackend {
+		t.Helper()
+		objects := initializedMemory(t)
+		options.WorldID, options.Logger = testWorldID, discardLogger
+		store, err := Open(context.Background(), objects, options)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		store.commitInterval = 0
+		return storetest.LookupBackend{Store: store}
+	}
+	storetest.RunRejectionConformance(t, storetest.RejectionFactories{
+		Quota: func(t *testing.T) storetest.LookupBackend { return open(t, Options{MaxDocuments: 2}) },
+		Policy: func(t *testing.T) storetest.LookupBackend {
+			seed := PolicySeed{
+				Body:     []byte("# Write Policy\n\nCurated.\n\nstrictness: block\nrequire_tags: domain\n"),
+				Metadata: policyMetadata(),
+			}
+			b := open(t, Options{PolicySeed: &seed})
+			b.Store = writepolicy.Enforce(b.Store, writepolicy.Options{Require: true})
+			return b
+		},
+	})
+}
+
+// TestWireGoldens holds the bucket backend to the wire fixtures the file
+// backend emits; regenerate them from storetest, never from here.
+func TestWireGoldens(t *testing.T) {
+	store, _ := newWritableStore(t)
+	backend := storetest.LookupBackend{Store: store}
+	storetest.RunWireGoldens(t, backend, "../../../../protocol/wiretest/testdata", false)
 }
 
 func TestFileDifferential(t *testing.T) {
@@ -36,7 +78,7 @@ func TestFileDifferential(t *testing.T) {
 		func(t *testing.T) storetest.LookupBackend { return storetest.FileBackend(t) },
 		func(t *testing.T) storetest.LookupBackend {
 			store, _ := newWritableStore(t)
-			return storetest.LookupBackend{Store: store, Catalog: store, Views: store}
+			return storetest.LookupBackend{Store: store}
 		},
 		storetest.DifferentialConfig{Seeds: []int64{1, 2}, Ops: 80},
 	)
@@ -51,7 +93,7 @@ func newWritableStore(t testing.TB) (*Store, *blob.Memory) {
 	if err := Initialize(context.Background(), objects, testWorldID); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
-	store, err := Open(context.Background(), objects, Options{WorldID: testWorldID})
+	store, err := Open(context.Background(), objects, Options{Logger: discardLogger, WorldID: testWorldID})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -66,11 +108,11 @@ func tamperBucketVersion(t testing.TB, documentStore handler.DocumentStore, path
 		t.Fatalf("tamper store is %T, want *bucketstore.Store", documentStore)
 	}
 	loaded := store.snapshot.Load()
-	entry, exists := loaded.Paths[protocolstore.CanonicalPath(path)]
+	entry, exists := loaded.Paths[storefmt.CanonicalPath(path)]
 	if !exists {
 		t.Fatalf("tamper path %s is missing", path)
 	}
-	view := &readView{ctx: context.Background(), cancel: func() {}, objects: store.objects, snapshot: loaded}
+	view := &readView{ctx: context.Background(), objects: store.objects, snapshot: loaded}
 	history, err := view.loadHistory(&entry)
 	if err != nil {
 		t.Fatalf("tamper load history: %v", err)

@@ -18,7 +18,7 @@ func newQuotaStore(t *testing.T, maxDocuments int) *Store {
 	if err := Initialize(context.Background(), objects, testWorldID); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
-	store, err := Open(context.Background(), objects, Options{WorldID: testWorldID, MaxDocuments: maxDocuments})
+	store, err := Open(context.Background(), objects, Options{Logger: discardLogger, WorldID: testWorldID, MaxDocuments: maxDocuments})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestMaxDocumentsRejectsNewPathBeyondQuota(t *testing.T) {
 	if _, err := store.WriteVersion("/one.md", 1, []byte("# One v2\n"), meta); err != nil {
 		t.Fatalf("update at quota: %v", err)
 	}
-	if _, err := store.Append("/two.md", 1, []byte("\nmore\n"), nil); err != nil {
+	if _, err := store.AppendVersion("/two.md", 1, []byte("\nmore\n"), nil); err != nil {
 		t.Fatalf("append at quota: %v", err)
 	}
 }

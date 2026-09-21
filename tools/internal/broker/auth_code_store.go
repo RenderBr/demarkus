@@ -131,6 +131,7 @@ type authCodeStore struct {
 	clock      func() time.Time
 	pendingTTL time.Duration
 	codeTTL    time.Duration
+	maxPending int
 }
 
 // newAuthCodeStore builds a fresh in-memory store. pendingTTL is the
@@ -153,6 +154,7 @@ func newAuthCodeStore(clock func() time.Time, pendingTTL, codeTTL time.Duration)
 		clock:      clock,
 		pendingTTL: pendingTTL,
 		codeTTL:    codeTTL,
+		maxPending: maxPendingGrants,
 	}
 }
 
@@ -170,11 +172,21 @@ func (s *authCodeStore) Begin(req *AuthCodeRequest) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.pending) >= s.maxPending {
+		return "", errGrantStoreFull
+	}
 	s.pending[id] = &PendingAuthCode{
 		AuthCodeRequest: *req,
 		ExpiresAt:       s.clock().Add(s.pendingTTL),
 	}
 	return id, nil
+}
+
+// Cancel drops a pending grant whose login could not be started.
+func (s *authCodeStore) Cancel(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pending, id)
 }
 
 // LookupPending returns a copy of the pending grant for the supplied

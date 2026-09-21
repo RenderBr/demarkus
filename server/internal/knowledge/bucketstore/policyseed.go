@@ -6,7 +6,8 @@ import (
 	"fmt"
 
 	"github.com/latebit-io/demarkus/protocol/publishpolicy"
-	protocolstore "github.com/latebit-io/demarkus/protocol/store"
+	"github.com/latebit-io/demarkus/protocol/storefmt"
+	"github.com/latebit-io/demarkus/server/internal/backend"
 	"github.com/latebit-io/demarkus/server/internal/knowledge/blob"
 )
 
@@ -20,10 +21,10 @@ type PolicySeed struct {
 // ValidatePolicySeed rejects a seed that would not survive a publish:
 // wrong document shape, invalid write, or an unenforceable policy.
 func ValidatePolicySeed(seed PolicySeed) error {
-	if err := protocolstore.ValidateDocumentContent(publishpolicy.DocumentPath, seed.Body); err != nil {
+	if err := storefmt.ValidateDocumentContent(publishpolicy.DocumentPath, seed.Body); err != nil {
 		return fmt.Errorf("invalid policy document: %w", err)
 	}
-	if err := protocolstore.ValidateWrite(seed.Body, seed.Metadata); err != nil {
+	if err := storefmt.ValidateWrite(seed.Body, seed.Metadata); err != nil {
 		return fmt.Errorf("invalid policy write: %w", err)
 	}
 	if err := publishpolicy.Parse(string(seed.Body)).Validate(); err != nil {
@@ -35,18 +36,18 @@ func ValidatePolicySeed(seed PolicySeed) error {
 // createPolicy publishes seed as the world's policy when it has none and
 // reports whether it created one. Create-only, so a restart never reverts
 // a policy that replaced an earlier seed.
-func (store *Store) createPolicy(seed PolicySeed) (bool, error) {
-	// The installed snapshot is the same freshness currentPolicy trusts,
-	// and an archived entry counts as present so no seed overwrites it.
+func (store *Store) createPolicy(ctx context.Context, seed PolicySeed) (bool, error) {
+	// An archived entry counts as present so no seed overwrites it.
 	if _, exists := store.snapshot.Load().Paths[publishpolicy.DocumentPath]; exists {
 		return false, nil
 	}
 	if err := ValidatePolicySeed(seed); err != nil {
 		return false, err
 	}
-	if _, err := store.WriteVersion(publishpolicy.DocumentPath, 0, seed.Body, seed.Metadata); err != nil {
+	request := backend.WriteRequest{Path: publishpolicy.DocumentPath, Content: seed.Body, Metadata: seed.Metadata}
+	if _, err := store.Publish(ctx, request); err != nil {
 		// A concurrent replica won the create; its policy stands.
-		if errors.Is(err, protocolstore.ErrConflict) {
+		if errors.Is(err, storefmt.ErrConflict) {
 			return false, nil
 		}
 		return false, fmt.Errorf("create policy: %w", err)
@@ -85,28 +86,15 @@ func EnsureWorld(ctx context.Context, objects blob.Store, worldID string) (bool,
 	return true, nil
 }
 
-// ensurePolicy makes the stored policy usable before enforcement starts:
-// seed it when absent and a seed is configured, then validate whatever
-// the world actually holds.
-func (store *Store) ensurePolicy(ctx context.Context, seed *PolicySeed) error {
-	if seed != nil {
-		// Mutations in this store carry their own request timeout, so a
-		// started write outlives a canceled ctx; refuse to start one.
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("seed policy: %w", err)
-		}
-		created, err := store.createPolicy(*seed)
-		if err != nil {
-			return err
-		}
-		if created {
-			store.logger.Info("seeded the initial write policy",
-				"world", store.worldID, "path", publishpolicy.DocumentPath)
-		}
+// seedPolicy publishes the seed when the world has no policy document.
+func (store *Store) seedPolicy(ctx context.Context, seed PolicySeed) error {
+	created, err := store.createPolicy(ctx, seed)
+	if err != nil {
+		return err
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, store.requestTimeout)
-	defer cancel()
-	view := &readView{ctx: requestCtx, cancel: func() {}, objects: store.objects, snapshot: store.snapshot.Load()}
-	_, err := view.currentPolicy(true)
-	return err
+	if created {
+		store.logger.Info("seeded the initial write policy",
+			"world_id", store.worldID, "path", publishpolicy.DocumentPath)
+	}
+	return nil
 }

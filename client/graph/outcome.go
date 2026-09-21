@@ -34,6 +34,7 @@ type CrawlOutcome struct {
 	Admitted     int
 	PeakFrontier int
 	PeakWorkers  int
+	RejectedRels int // rel- metadata values that produced no edge
 	cause        error
 }
 
@@ -52,7 +53,7 @@ func (o *CrawlOutcome) Is(target error) bool { return target == ErrIncomplete &&
 // CrawlWarning removes an already-rendered outcome from joined persistence errors.
 // Other errors retain their context and identity, including ordinary wrappers.
 func CrawlWarning(err error, outcome *CrawlOutcome) error {
-	if err == nil || err == outcome {
+	if err == nil || err == outcome { //nolint:errorlint // identity only; wrappers keep their context
 		return nil
 	}
 	joined, ok := err.(interface{ Unwrap() []error })
@@ -80,6 +81,9 @@ func (o *CrawlOutcome) Summary() string {
 	}
 	if o.Failures > 0 {
 		s += fmt.Sprintf("; failed: %d", o.Failures)
+	}
+	if o.RejectedRels > 0 {
+		s += fmt.Sprintf("; rejected relations: %d", o.RejectedRels)
 	}
 	return s
 }

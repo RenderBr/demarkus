@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 
 	"slices"
@@ -35,6 +36,7 @@ type Crawler struct {
 	client FetchClient
 	state  *State
 	tokens *tokens.Store
+	cred   tokens.Credential
 
 	// Crawl results
 	runMu          sync.Mutex
@@ -57,6 +59,7 @@ func NewCrawler(cfg Config, client FetchClient, state *State, tokenStore *tokens
 		client:     client,
 		state:      state,
 		tokens:     tokenStore,
+		cred:       tokens.Credential{Origin: singleHubHost(cfg.Hubs)},
 		hashes:     make(map[string][]index.Entry),
 		servers:    make(map[string]bool),
 		graph:      graph.New(),
@@ -468,10 +471,22 @@ func (c *Crawler) isPublishOnlyHub(host string) bool {
 	return slices.Contains(c.cfg.Hubs, authority) && !slices.Contains(c.cfg.Seeds, authority)
 }
 
+// singleHubHost returns the dial host DEMARKUS_AUTH belongs to: the hub when
+// exactly one is configured, else none, so crawled hosts never receive it.
+func singleHubHost(hubs []string) string {
+	if len(hubs) != 1 {
+		return ""
+	}
+	host, _, err := fetch.ParseMarkURL(hubs[0])
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
 // resolveToken returns the auth token for a host.
 func (c *Crawler) resolveToken(host string) string {
-
-	return tokens.Resolve("", host, c.tokens)
+	return tokens.Resolve(c.cred, host, c.tokens)
 }
 
 // Hashes returns all collected content hashes flattened to single entries.
@@ -579,6 +594,9 @@ func (c *Crawler) PublishToHubs(ctx context.Context, client PublishClient, perSe
 func (c *Crawler) recordEdges(host, docPath, body string, meta map[string]string) []graph.Edge {
 	url := links.NodeURL(host, docPath)
 	extracted := graph.ExtractDocumentEdges(url, body, meta)
+	for _, rejected := range extracted.RejectedRels {
+		slog.Warn("relation metadata skipped", "doc", url, "key", rejected.Key, "value", rejected.Value, "reason", rejected.Reason)
+	}
 	edges := make([]graph.Edge, 0, len(extracted.Edges))
 	var linkCount int
 	for _, edge := range extracted.Edges {
