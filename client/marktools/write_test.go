@@ -53,6 +53,8 @@ func TestPublishSendsTheWriteWithIdentity(t *testing.T) {
 	}
 }
 
+// Arguments are checked before authorization, authorization before any write:
+// a caller fixes what it sent before learning it may not write at all.
 func TestPublishChecksInOrder(t *testing.T) {
 	backend := &fetchtest.Client{}
 	tools := newTools(t, backend, writingHooks())
@@ -61,10 +63,10 @@ func TestPublishChecksInOrder(t *testing.T) {
 		want string
 	}{
 		"bad url first":          {marktools.PublishArgs{URL: "bad"}, "invalid URL: unsupported scheme"},
-		"then authorization":     {marktools.PublishArgs{URL: "/locked.md"}, "publish requires a token"},
-		"then the version":       {marktools.PublishArgs{URL: "/doc.md"}, "expected_version is required"},
-		"negative version":       {marktools.PublishArgs{URL: "/doc.md", ExpectedVersion: new(-1)}, "expected_version must be >= 0"},
-		"then the conflict mode": {marktools.PublishArgs{URL: "/doc.md", ExpectedVersion: new(1), OnConflict: "overwrite"}, `invalid on_conflict "overwrite": expected "merge" or "fail"`},
+		"then the version":       {marktools.PublishArgs{URL: "/locked.md"}, "expected_version is required"},
+		"negative version":       {marktools.PublishArgs{URL: "/locked.md", ExpectedVersion: new(-1)}, "expected_version must be >= 0"},
+		"then the conflict mode": {marktools.PublishArgs{URL: "/locked.md", ExpectedVersion: new(1), OnConflict: "overwrite"}, `invalid on_conflict "overwrite": expected "merge" or "fail"`},
+		"then authorization":     {marktools.PublishArgs{URL: "/locked.md", ExpectedVersion: new(1)}, "publish requires a token"},
 	} {
 		if got := tools.Publish(t.Context(), tt.args); !got.IsError || got.Text != tt.want {
 			t.Errorf("%s: got %+v, want %q", name, got, tt.want)
@@ -72,6 +74,22 @@ func TestPublishChecksInOrder(t *testing.T) {
 	}
 	if len(backend.PublishCalls) != 0 {
 		t.Error("a refused publish must not reach the backend")
+	}
+}
+
+func TestAppendChecksItsVersionBeforeAuthorizing(t *testing.T) {
+	backend := &fetchtest.Client{}
+	tools := newTools(t, backend, writingHooks())
+	got := tools.Append(t.Context(), marktools.AppendArgs{URL: "/locked.md", Body: "x", ExpectedVersion: -1})
+	if !got.IsError || got.Text != "expected_version must be >= 0" {
+		t.Errorf("bad version = %+v", got)
+	}
+	got = tools.Append(t.Context(), marktools.AppendArgs{URL: "/locked.md", Body: "x"})
+	if !got.IsError || got.Text != "append requires a token" {
+		t.Errorf("refused = %+v", got)
+	}
+	if n := len(backend.VersionsCalls) + len(backend.AppendCalls); n != 0 {
+		t.Errorf("backend calls = %d, want none before authorization", n)
 	}
 }
 
@@ -142,10 +160,11 @@ func TestWritesReconcileAfterAnUnknownOutcome(t *testing.T) {
 			wantText: "append failed: read response: request sent but outcome unknown; it may have landed: fetch the document before retrying",
 		},
 		{
-			name:     "archive, landed",
-			call:     func(tools *marktools.Tools) marktools.Result { return tools.Archive(t.Context(), "/doc.md") },
-			head:     fetch.Result{Response: protocol.Response{Status: protocol.StatusArchived, Metadata: map[string]string{"version": "4"}}},
-			wantText: "status: ok\nversion: 4\narchived: true\n",
+			name: "archive, landed",
+			call: func(tools *marktools.Tools) marktools.Result { return tools.Archive(t.Context(), "/doc.md") },
+			head: fetchtest.Archived(),
+			// An archived document answers without a version, so none is claimed.
+			wantText: "status: ok\narchived: true\n",
 		},
 		{
 			name: "archive, still live",
@@ -164,7 +183,12 @@ func TestWritesReconcileAfterAnUnknownOutcome(t *testing.T) {
 				ArchiveFn: func(context.Context, fetch.ArchiveRequest) (fetch.Result, error) {
 					return fetch.Result{}, fetchtest.LostResponse()
 				},
-				FetchFn: func(context.Context, fetch.FetchRequest) (fetch.Result, error) { return tt.head, nil },
+				FetchFn: func(_ context.Context, r fetch.FetchRequest) (fetch.Result, error) {
+					if r.Path == "/doc.md/v3" {
+						return fetchtest.Head("old", 3, nil), nil // the base every write here started from
+					}
+					return tt.head, nil
+				},
 			}
 			got := tt.call(newTools(t, backend, writingHooks()))
 			if got.IsError != tt.wantErr || got.Text != tt.wantText {
