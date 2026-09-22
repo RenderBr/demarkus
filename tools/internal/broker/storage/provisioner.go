@@ -78,6 +78,8 @@ type Provisioner struct {
 	log     *slog.Logger
 	clock   func() time.Time
 
+	// refusals answers a refused identity from memory, off the lock.
+	refusals tenantRefusals
 	// mu single-flights provisioning within one pod; cross-pod
 	// convergence rides the registry Secret's optimistic concurrency.
 	mu sync.Mutex
@@ -194,9 +196,11 @@ func (p *Provisioner) DeprovisionTenant(ctx context.Context, slug string, delete
 	return found, nil
 }
 
-// applySnapshot publishes a registry snapshot to this pod's world set
-// and identity index.
+// applySnapshot publishes a registry snapshot to this pod's world set and
+// identity index. The registry changed, so every remembered refusal may now
+// be admitted and is forgotten.
 func (p *Provisioner) applySnapshot(registry *tenantRegistry) {
+	p.refusals.clear()
 	rejected := p.cfg.Registry().SetDynamic(p.worldsFromRegistry(registry), tenantIndexFromRegistry(registry))
 	if len(rejected) > 0 {
 		// Written by hand or by an older build: no tool URL can name them.
@@ -311,8 +315,41 @@ func (p *Provisioner) admits(claims *core.Claims) error {
 // its broker-side WorldConfig. Every step is idempotent and keyed by
 // the slug pinned in the registry; any replica can re-run it safely.
 func (p *Provisioner) EnsureTenant(ctx context.Context, claims *core.Claims) (core.WorldConfig, error) {
+	identity := core.IdentityKey(p.cfg.OIDC.Issuer, claims.Subject)
+	if refusal := p.refusals.recent(identity, p.clock()); refusal != nil {
+		return core.WorldConfig{}, refusal
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	world, err := p.ensureTenant(ctx, claims)
+	if err != nil {
+		// Still under p.mu: a registry sync cannot clear the memory
+		// between this refusal and its remembering.
+		p.refuse(identity, claims.Subject, err)
+	}
+	return world, err
+}
+
+// refuse logs a refusal and remembers gate and capacity ones under p.mu; they
+// expire after refusalTTL or when the registry changes. Deprovisioning refusals
+// stay uncached because a tombstone can clear before this pod syncs.
+func (p *Provisioner) refuse(identity, subject string, err error) {
+	switch {
+	case errors.Is(err, ErrProvisioningDenied):
+		p.log.Warn("tenant provisioning denied by gate", "subject", core.HashSubject(subject))
+	case errors.Is(err, ErrTenantCapacity):
+		p.log.Warn("tenant provisioning denied at capacity", "subject", core.HashSubject(subject))
+	case errors.Is(err, ErrTenantDeprovisioning):
+		p.log.Warn("tool call denied for tombstoned tenant", "subject", core.HashSubject(subject))
+		return
+	default:
+		return
+	}
+	p.refusals.remember(identity, err, p.clock())
+}
+
+// ensureTenant is EnsureTenant's body; the caller holds p.mu.
+func (p *Provisioner) ensureTenant(ctx context.Context, claims *core.Claims) (core.WorldConfig, error) {
 	// The lock queue can outlive the request; do no remote work for a
 	// caller that already went away.
 	if err := ctx.Err(); err != nil {
