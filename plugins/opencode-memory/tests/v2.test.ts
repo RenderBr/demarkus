@@ -23,11 +23,21 @@ test("V2 registers MCP, guards writes and delivers guidance and nudges", async (
   };
   const gateCalls: unknown[] = [];
   const lifecycle: string[] = [];
+  const notices: string[] = [];
   const stop = await setupV2(ctx, {
-    legacy: async () => ({
-      config: async (config: any) => { config.mcp = { "demarkus-memory": { type: "local", command: ["bin", "mcp-serve"], enabled: true } }; },
-      event: async ({ event }: { event: { type: string } }) => { lifecycle.push(event.type); },
-    } as any),
+    legacy: async ({ client }) => {
+      const original = console.error;
+      console.error = (message: string) => { notices.push(message); };
+      try {
+        await client.tui?.showToast?.({ body: { message: "bootstrap failed", variant: "warning" } });
+      } finally {
+        console.error = original;
+      }
+      return {
+        config: async (config: any) => { config.mcp = { "demarkus-memory": { type: "local", command: ["bin", "mcp-serve"], enabled: true } }; },
+        event: async ({ event }: { event: { type: string } }) => { lifecycle.push(event.type); },
+      } as any;
+    },
     guidance: async () => "Recall first",
     nudge: async (input) => input.event === "recall" ? "Recall nudge" : input.event === "promote" ? "Promote nudge" : "Journal nudge",
     gate: async (tool, input, directory) => {
@@ -36,6 +46,7 @@ test("V2 registers MCP, guards writes and delivers guidance and nudges", async (
     },
   });
   assert.deepEqual(servers.get("demarkus-memory"), { type: "local", command: ["bin", "mcp-serve"] });
+  assert.deepEqual(notices, ["[demarkus-memory] bootstrap failed"]);
   const prompt = { sessionID: "s1", prompt: { text: "original" } };
   await hooks.get("prompt")!(prompt);
   assert.equal(prompt.prompt.text, "original");

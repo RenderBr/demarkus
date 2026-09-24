@@ -462,10 +462,18 @@ type V2Services = {
   nudge?: typeof callNudge;
 };
 
+/** Registers V2 memory hooks without persisting guidance in user prompts. */
 export async function setupV2(ctx: V2Context, services: V2Services = {}): Promise<() => void> {
   const directory = ctx.location.directory;
   // Reuse the V1 MCP builder so local and joined memories stay in sync.
-  const legacy = await (services.legacy ?? DemarkusMemoryPlugin)({ directory, client: {} });
+  const legacy = await (services.legacy ?? DemarkusMemoryPlugin)({
+    directory,
+    client: { tui: { showToast: async ({ body }) => {
+      const message = `[demarkus-memory] ${body.message}`;
+      if (body.variant === "warning") console.error(message);
+      else console.info(message);
+    } } },
+  });
   const config: Record<string, any> = {};
   await legacy.config(config);
   await ctx.mcp.transform((editor) => {
